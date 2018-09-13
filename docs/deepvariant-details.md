@@ -37,11 +37,10 @@ in detail in the [quick start].
 *   Files with the `.gz` suffix are interpreted as being compressed with gzip
     and are read/written accordingly.
 *   All of the DeepVariant tools can read/write their inputs/outputs from local
-    disk as well as directly from a cloud storage bucket. Directly accessing BAM
-    and reference files from cloud storage is currently not as efficient as we'd
-    like and will certainly improve over time, both in the current
-    implementation as well as when [htsget] is widely available. See the
-    discussion below on reading directly from cloud buckets for details.
+    disk as well as directly from a cloud storage bucket (through gcsfuse). In
+    the [whole genome case study] and [exome case study], we didn't use gcsfuse
+    because there is not much benefit on a single machine compared to just
+    copying the files first.
 
 ### make_examples
 
@@ -58,8 +57,43 @@ the program will be 10% of the regions and the output will be written to
 `examples.tfrecord-00000-of-00010.gz`. A concrete example of using multiple
 processes and sharded data is given in the [quick start].
 
-The reference genome FASTA, passed in using the `--ref` flag, must be indexed
-and can either be uncompressed or compressed with bgzip.
+#### Input assumptions
+
+`make_examples` requires its input files to satisfy a few basic requirements to
+be processed correctly.
+
+First, the reference genome FASTA, passed in using the `--ref` flag, must be
+indexed and can either be uncompressed or compressed with bgzip.
+
+Second, the BAM file provided to `--reads` should be aligned to a "compatible"
+version of the genome reference provided as the `--ref`. By compatible here we
+mean the BAM and FASTA share at least a reasonable set of common contigs, as
+DeepVariant will only process contigs shared by both the BAM and reference. As
+an example, suppose you have a BAM file mapped to b37 + decoy FASTA and you
+provide just the vanilla b37 fasta to `make_examples`. DeepVariant will only
+process variants on the shared contigs, effectively excluding the hs37d5 contig
+present in the BAM but not in the reference.
+
+The BAM file must be also sorted and indexed. It must exist on disk, so you
+cannot pipe it into DeepVariant. We currently recommend that the BAM be
+duplicate marked, but it's unclear if this is even necessary. Finally, it's not
+necessary to recalibrate the base qualities or do any form of indel realignment.
+
+Third, if you are providing `--regions` or other similar arguments these should
+refer to contigs present in the reference genome. These arguments accept
+space-separated lists, so all of the follow examples are valid arguments for
+`--regions` or similar arguments:
+
+*   `--regions chr20` => only process all of chromosome 20
+*   `--regions chr20:10,000,000-11,000,000` => only process 10-11mb of chr20
+*   `--regions "chr20 chr21"` => only process chromosomes 20 and 21
+
+Fourth and finally, if running in training mode the `truth_vcf` and
+`confident_regions` arguments should point to VCF and BED files containing the
+true variants and regions where we are confident in our calls (i.e., calls
+within these regions and not in the truth_vcf are considered false positives).
+These should be bgzipped and tabix indexed and be on a reference consistent with
+the one provided with the `--ref` argument.
 
 ### call_variants
 
@@ -139,7 +173,8 @@ the [whole genome case study] or the [exome case study].
 
 `postprocess_variants` reads all of the output TFRecord files from
 `call_variants`, sorts them, combines multi-allelic records, and writes out a
-VCF file.
+VCF file. When [gVCF output](deepvariant-gvcf-support.md) is requested, it also
+outputs a gVCF file which merges the VCF with the non-variant sites.
 
 Because `postprocess_variants` combines and sorts the output of
 `call_variants`, it needs to see all of the outputs from `call_variants` for a
@@ -160,7 +195,7 @@ Key changes and improvements include:
 We have made a number of improvements to the methodology as well. The biggest
 change was to move away from RGB-encoded (3-channel) pileup images and instead
 represent the aligned read data using a multi-channel tensor data layout. We
-current represent the data as a 7-channel raw tensor in which we encode:
+currently represent the data as a 6-channel raw tensor in which we encode:
 
 *   The read base (A, C, G, T)
 *   The base's quality score
@@ -168,7 +203,6 @@ current represent the data as a 7-channel raw tensor in which we encode:
 *   The read's strand (positive or negative)
 *   Does the read support the allele being evaluated?
 *   Does the base match the reference genome at this position?
-*   The CIGAR operation length for the current op
 
 These are all readily derived from the information found in the BAM file
 encoding of each read.
@@ -198,6 +232,39 @@ SNP   | 735  | 363  | 0.999759 | 0.999881  | 0.999820
 
 See the [whole genome case study], which we update with each release of
 DeepVariant, for the latest results.
+
+You can also see the [Datalab example] to see how you can visualize the pileup
+images.
+
+## Training data over time
+
+For the models we've released over time, here are more details of the training
+data we used.
+
+For even more details, see
+[DeepVariant training data](deepvariant-details-training-data.md).
+
+### WGS models
+
+version | Replicates                             | #examples
+------- | -------------------------------------- | -----------
+v0.4    | 9 HG001                                | 85,323,867
+v0.5    | 9 HG001<br>2 HG005<br>78 HG001 WES<br>1 HG005 WES<sup>[(1)](#myfootnote1)</sup> | 115,975,740
+v0.6    | 10 HG001 PCR-free<br>2 HG005 PCR-free<br>4 HG001 PCR+     | 156,571,227
+v0.7    | 10 HG001 PCR-free<br>2 HG005 PCR-free<br>4 HG001 PCR+     | 158,571,078
+
+### WES models
+
+version | Replicates                  | #examples
+------- | --------------------------- | ------------------------------
+v0.5    | 78 HG001 WES<br>1 HG005 WES | 15,714,062
+v0.6    | 78 HG001 WES<br>1 HG005 WES<sup>[(2)](#myfootnote2)</sup> | 15,705,449
+v0.7    | 78 HG001 WES<br>1 HG005 WES | 15,704,197
+
+
+<a name="myfootnote1">(1)</a>: In v0.5, we experimented with adding whole exome sequencing data into training data. In v0.6, we took it out because it didn't improve the WGS accuracy.
+
+<a name="myfootnote2">(2)</a>: The training data are from the same replicates as v0.5. The number of examples changed because of the update in [haplotype_labeler](https://github.com/google/deepvariant/tree/r0.6/deepvariant/labeler/haplotype_labeler.py).
 
 ## Optimizing DeepVariant
 
@@ -284,66 +351,108 @@ different machine types. Moreover, the optimal configuration may change over
 time as DeepVariant, TensorFlow, and the CPU, GPU, and
 [TPU](https://cloud.google.com/tpu/) hardware evolves.
 
-## Reading directly from Google Cloud Storage (GCS) buckets
+## CRAM support
 
-DeepVariant can read SAM/BAM and fasta sources from GCS buckets, as well as read
-and write TFRecord (i.e., TensorFlow examples) to/from GCS buckets. In fact, in
-general DeepVariant can read SAM/BAM/FASTA files from any source supported by
-[htslib] and/or TensorFlow.
+As of v0.7, DeepVariant accepts CRAM files as input in addition to BAM files.
+CRAM files encoded without reference compression or those with embedded
+references just work with DeepVariant. However, CRAM files using an external
+reference version may not work out-of-the-box. If the path to the original
+reference (encoded in the file's "UR" tag) is accessible on the machine directly
+or is already in the local genome cache, then DeepVariant should just work.
+Otherwise those files cannot be used with DeepVariant at this time.
+Consequently, we don't recommend using CRAM files with external reference files,
+but instead suggest using read sequence compression with embedded reference
+data. (This has a minor impact of file size, but significantly improves file
+access simplicity and safety.)
 
-DeepVariant runs slightly slower when processing reads directly from GCS; our
-current best estimates are roughly a ~3-5% slowdown for an end-to-end run of
-`make_examples` compared to first localizing the entire BAM to a local
-persistent SSD on the cloud instance. Consequently, the choice of whether to
-first copy the BAM to local disk or directly read from a GCS bucket depends on
-how one is running DeepVariant. If running `make_examples` on a single big
-multi-core machine as in the Case Study examples, it is likely advantageous to
-first localize the BAM as copying the full 50x BAM to local disk only takes
-10-20 minutes, a small overhead compared to the end-to-end runtime of
-`make_examples`. However, more advanced distributed runs of DeepVariant, such as
-running distributed DeepVariant with [dsub] and the [Pipelines API] as
-exemplified by the [DeepVariant with docker], can benefit
-enormously from this capability. When there are N instances running
-`make_examples` in a distributed fashion, the overhead of localization is N
-times larger, all the worse since each `make_examples` run is only accessing
-roughly 1 / N of the BAM reads. Moreover, distributing `make_examples` over many
-machines enables far more parallelizing than even the largest instance, so the
-per-instance runtime can be only marginally longer than the cost to localize the
-BAM itself. In this situation direct GCS access is likely the best option
-despite its slight overhead.
+For more information about CRAM, see the
+[`samtools` documentation](http://www.htslib.org/doc/samtools.html) in general
+but particularly the sections on
+[Global Options](http://www.htslib.org/doc/samtools.html#GLOBAL_OPTIONS) and
+[reference sequences in CRAM](http://www.htslib.org/doc/samtools.html#REFERENCE_SEQUENCES).
+`htslib` also hosts a nice page
+[benchmarking CRAM](http://www.htslib.org/benchmarks/CRAM.html) with information
+on the effect of different CRAM options on file size and encoding/decoding
+performance.
 
-As of 12/4/17, there are some limitations to remote file access that we are
-working to overcome:
+Here are some basic file size and runtime numbers for running a single
+`make_examples` job on the case-study data in BAM and CRAM format (with embedded
+references) on a BAM/CRAM file for all of chromosome 20 and running on
+20:10mb-11mb:
 
-*   GCS BAM: there's a race condition in [htslib] when running multiple
-    `make_examples` jobs `parallel` on a single instance. [htslib] downloads the
-    BAI file to local disk, and multiple parallel executions of `make_examples`
-    will all try to load this BAI file at the same time, resulting in data
-    corruption. In this situation it is safest to simply localize the BAI file
-    (but not the BAM) to the directory where you are running `make_examples`.
-    This is not necessary if you are just running a single `make_examples`
-    process on the machine or run each `make_examples` job in separate working
-    directories.
-*   GCS fasta: there is a problem in [htslib] where the connection to the FASTA
-    file is getting dropped, so long-running `make_examples` can fail using a
-    remote FASTA can fail. We are looking at how to fix this issue.
+Filetype | Size (Gb) | Runtime (min)
+-------- | --------- | -------------
+BAM      | 2.1G      | 7m53.589s
+CRAM     | 1.2G      | 10m37.904s
+-------- | --------- | -------------
+Ratio    | 57%       | 135%
 
-Note these concerns do not apply to persistent mounted remote filesystems like
-NFS or Fuse, only to non-POSIX remote systems like GCS or FTP.
+## Reading from Google Cloud Storage (GCS) using gcsfuse
 
-As of today, the safest, performant approach to using remote reads and reference
-files with DeepVariant `make_examples` is to localize the reference fasta and
-associated fai/gzi metadata as well as the BAI, while leaving the BAM itself
-remote, which is almost always the largest data source needed by DeepVariant.
+[gcsfuse](https://github.com/GoogleCloudPlatform/gcsfuse) allows access to files
+in the GCS bucket much like local files.
 
-The examples output of `make_examples` and both the input examples and output
-calls of `call_variants` can be read from / written to GCS.
+### Install gcsfuse
 
-Currently `postprocess_variants` supports reading its inputs directly from GCS
-but the output must go to a local disk.
+Install gcsfuse package as explained
+[here](https://github.com/GoogleCloudPlatform/gcsfuse/blob/master/docs/installing.md)
+(recommended).
 
-[htsget]: http://samtools.github.io/hts-specs/htsget.html
-[htslib]: http://www.htslib.org/
+### Mount GCS Bucket
+
+First ensure your "application default" credential for GCP is available. The
+easiest way to set this up is to run gcloud tool.
+
+```
+gcloud auth application-default login
+```
+
+Then mount the bucket to a dir on your local machine.
+
+```
+mkdir -p $local_dir                  # E.g. local_dir=$HOME/input
+gcsfuse $gcs_bucket_name $local_dir  # E.g. gcs_bucket_name=deepvariant
+```
+
+Confirm it is mounted successfully by doing `ls` on `$local_dir`. If there is a
+problem, you may want to unmount and mount again.
+
+```
+fusermount -u $local_dir  # Linux
+umount $local_dir         # OS X
+```
+
+Now you can run DeepVariant as if the input files are stored locally under
+`$local_dir`.
+
+### Known Issue
+
+Currently gcsfuse does not work well with DeepVariant in multi-tasking scenarios
+, i.e. one gcsfuse daemon and multiple DeepVariant tasks (see the
+[issue](https://github.com/GoogleCloudPlatform/gcsfuse/issues/262)). There are
+two workarounds for this:
+
+1.  Run multiple gcsfuse; one gcsfuse daemon for every DeepVariant task.
+
+    ```
+    for i in `seq 1 $num_task`;do
+      mkdir -p $local_dir_task_$i
+      gcsfuse $gcs_bucket_name $local_dir_task_$i
+    done
+    ```
+
+2.  Reduce read sizes in DeepVariant tasks. For example, we observed that the
+    issue disappears for `make_examples` if hts block size is reduced to `128KB`
+    (from default `128MB`). Use `--hts_block_size` flag for this.
+
+### Useful gcsfuse links
+
+*   [gcsfuse installing
+    doc](https://github.com/GoogleCloudPlatform/gcsfuse/blob/master/docs/installing.md)
+*   [mounting
+    doc](https://github.com/GoogleCloudPlatform/gcsfuse/blob/master/docs/mounting.md)
+    (if you exprienced credentional issue)
+
 [dsub]: https://cloud.google.com/genomics/v1alpha2/dsub
 [Pipelines API]: https://cloud.google.com/genomics/v1alpha2/pipelines
 [DeepVariant with docker]: deepvariant-docker.md
@@ -352,3 +461,4 @@ but the output must go to a local disk.
 [quick start]: deepvariant-quick-start.md
 [Running DeepVariant on Google Cloud Platform]: https://cloud.google.com/genomics/deepvariant
 [TensorFlow]: http://www.tensorflow.org/
+[Datalab example]: visualizing_examples.ipynb

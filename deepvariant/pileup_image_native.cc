@@ -32,20 +32,20 @@
 #include "deepvariant/pileup_image_native.h"
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "deepvariant/core/genomics/cigar.pb.h"
-#include "deepvariant/core/genomics/position.pb.h"
-#include "deepvariant/core/genomics/reads.pb.h"
-#include "deepvariant/core/genomics/variants.pb.h"
-#include "deepvariant/core/protos/core.pb.h"
+#include "third_party/nucleus/protos/cigar.pb.h"
+#include "third_party/nucleus/protos/position.pb.h"
+#include "third_party/nucleus/protos/reads.pb.h"
+#include "third_party/nucleus/protos/variants.pb.h"
 #include "tensorflow/core/platform/logging.h"
 
-using learning::genomics::v1::Read;
-using learning::genomics::v1::CigarUnit;
+using nucleus::genomics::v1::Read;
+using nucleus::genomics::v1::CigarUnit;
 using std::vector;
 
 using learning::genomics::deepvariant::DeepVariantCall;
@@ -94,8 +94,7 @@ ImageRow::ImageRow(int width)
       mapping_quality(width, 0),
       on_positive_strand(width, 0),
       supports_alt(width, 0),
-      matches_ref(width, 0),
-      op_len(width, 0)
+      matches_ref(width, 0)
 {}
 
 int ImageRow::Width() const {
@@ -103,8 +102,7 @@ int ImageRow::Width() const {
         base.size() == mapping_quality.size() &&
         base.size() == on_positive_strand.size() &&
         base.size() == supports_alt.size() &&
-        base.size() == matches_ref.size() &&
-        base.size() == op_len.size());
+        base.size() == matches_ref.size());
   return base.size();
 }
 
@@ -113,6 +111,9 @@ PileupImageEncoderNative::PileupImageEncoderNative(
     : options_(options) {
     CHECK((options_.width() % 2 == 1) && options_.width() >= 3)
         << "Width must be odd; found " << options_.width();
+    CHECK(options_.num_channels() == NUM_CHANNELS)
+        << "Expected options.num_channels to be " << NUM_CHANNELS
+        << " but saw " << options_.num_channels() << " instead";
 }
 
 // Gets the pixel color (int) for a base.
@@ -191,11 +192,10 @@ PileupImageEncoderNative::EncodeRead(const DeepVariantCall& dv_call,
   // Return value: true on normal exit; false if we determine that we
   // have a low quality base at the call position (in which case we
   // should return null) from EncodeRead.
-  std::function<bool(int, int, const CigarUnit::Operation&, int)>
+  std::function<bool(int, int, const CigarUnit::Operation&)>
   action_per_cigar_unit = [&](int ref_i,
                               int read_i,
-                              const CigarUnit::Operation& cigar_op,
-                              int cigar_op_len) {
+                              const CigarUnit::Operation& cigar_op) {
     char read_base = 0;
     if (cigar_op == CigarUnit::INSERT) {
       // redacted
@@ -225,7 +225,6 @@ PileupImageEncoderNative::EncodeRead(const DeepVariantCall& dv_call,
       img_row.on_positive_strand[col] = strand_color;
       img_row.supports_alt[col]       = alt_color;
       img_row.matches_ref[col]        = MatchesRefColor(matches_ref);
-      img_row.op_len[col]             = cigar_op_len;
     }
     return true;
   };
@@ -281,7 +280,7 @@ PileupImageEncoderNative::EncodeRead(const DeepVariantCall& dv_call,
       case CigarUnit::SEQUENCE_MISMATCH:
         // Alignment op.
         for (int i = 0; i < op_len; i++) {
-          ok = ok && action_per_cigar_unit(ref_i, read_i, op, op_len);
+          ok = ok && action_per_cigar_unit(ref_i, read_i, op);
           ref_i++;
           read_i++;
         }
@@ -289,13 +288,13 @@ PileupImageEncoderNative::EncodeRead(const DeepVariantCall& dv_call,
       case CigarUnit::INSERT:
       case CigarUnit::CLIP_SOFT:
         // Insert op.
-        ok = action_per_cigar_unit(ref_i - 1, read_i, op, op_len);
+        ok = action_per_cigar_unit(ref_i - 1, read_i, op);
         read_i += op_len;
         break;
       case CigarUnit::DELETE:
       case CigarUnit::SKIP:
         // Delete op.
-        ok = action_per_cigar_unit(ref_i, read_i - 1, op, op_len);
+        ok = action_per_cigar_unit(ref_i, read_i - 1, op);
         ref_i += op_len;
         break;
       case CigarUnit::CLIP_HARD:
@@ -335,7 +334,6 @@ PileupImageEncoderNative::EncodeReference(const string& ref_bases) {
     img_row.on_positive_strand[i] = strand_color;
     img_row.supports_alt[i]       = alt_color;
     img_row.matches_ref[i]        = ref_color;
-    img_row.op_len[i]             = 0;
   }
 
   return std::unique_ptr<ImageRow>(new ImageRow(img_row));

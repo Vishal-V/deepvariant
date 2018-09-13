@@ -1,4 +1,5 @@
 load("//:third_party/clif.bzl", "pyclif_proto_library")
+load("//:tools/nucleus.bzl", "nucleus_py_library", "nucleus_py_extension", "nucleus_py_binary")
 
 package(
     default_visibility = [
@@ -14,6 +15,7 @@ filegroup(
         "model_eval",
         "model_train",
         "postprocess_variants",
+        "//deepvariant/realigner/allele_count_linear:generate_trained_model",
     ],
 )
 
@@ -26,6 +28,8 @@ filegroup(
         "testdata/*.tfrecord*",
         "testdata/*.vcf*",
         "testdata/*.fasta*",
+        "testdata/*.pbtxt*",
+        "testdata/*.pckl*",
     ]),
 )
 
@@ -41,12 +45,14 @@ test_suite(
 )
 
 # Umbrella library for all the Python under DeepVariant.
-py_library(
+nucleus_py_library(
     name = "deepvariant_py",
     srcs = [],
     deps = [
         ":call_variants_lib",
         ":data_providers",
+        ":dv_vcf_constants",
+        ":haplotypes",
         ":make_examples_lib",
         ":model_eval_lib",
         ":model_train_lib",
@@ -66,13 +72,14 @@ cc_library(
     hdrs = ["allelecounter.h"],
     deps = [
         ":utils",
-        "//deepvariant/core:cpp_utils",
-        "//deepvariant/core:reference",
-        "//deepvariant/core/genomics:cigar_cc_pb2",
-        "//deepvariant/core/genomics:position_cc_pb2",
-        "//deepvariant/core/genomics:range_cc_pb2",
-        "//deepvariant/core/genomics:reads_cc_pb2",
         "//deepvariant/protos:deepvariant_cc_pb2",
+        "//third_party/nucleus/io:reference",
+        "//third_party/nucleus/protos:cigar_cc_pb2",
+        "//third_party/nucleus/protos:position_cc_pb2",
+        "//third_party/nucleus/protos:range_cc_pb2",
+        "//third_party/nucleus/protos:reads_cc_pb2",
+        "//third_party/nucleus/util:cpp_utils",
+        "@com_google_absl//absl/strings",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
@@ -84,12 +91,12 @@ cc_test(
     deps = [
         ":allelecounter",
         ":utils",
-        "//deepvariant/core:cpp_test_utils",
-        "//deepvariant/core:cpp_utils",
-        "//deepvariant/core:reference_fai",
-        "//deepvariant/core:reference_test",
-        "//deepvariant/core/genomics:position_cc_pb2",
-        "//deepvariant/testing:gunit_extras",
+        "//third_party/nucleus/io:reference_fai",
+        "//third_party/nucleus/io:reference_test",
+        "//third_party/nucleus/protos:position_cc_pb2",
+        "//third_party/nucleus/testing:cpp_test_utils",
+        "//third_party/nucleus/testing:gunit_extras",
+        "//third_party/nucleus/util:cpp_utils",
         "@com_google_googletest//:gtest_main",
         "@org_tensorflow//tensorflow/core:lib",
         "@org_tensorflow//tensorflow/core:test",
@@ -101,9 +108,9 @@ cc_library(
     srcs = ["postprocess_variants.cc"],
     hdrs = ["postprocess_variants.h"],
     deps = [
-        "//deepvariant/core:cpp_utils",
-        "//deepvariant/core/genomics:variants_cc_pb2",
-        "//deepvariant/core/protos:core_cc_pb2",
+        "//third_party/nucleus/util:cpp_utils",
+        "//third_party/nucleus/protos:variants_cc_pb2",
+        "//third_party/nucleus/protos:reference_cc_pb2",
         "//deepvariant/protos:deepvariant_cc_pb2",
         "@org_tensorflow//tensorflow/core:lib",
         # redacted
@@ -120,8 +127,9 @@ cc_test(
     ],
     deps = [
         ":postprocess_variants_lib",
-        "//deepvariant/core:cpp_test_utils",
-        "//deepvariant/core/genomics:variants_cc_pb2",
+        "//third_party/nucleus/protos:reference_cc_pb2",
+        "//third_party/nucleus/protos:variants_cc_pb2",
+        "//third_party/nucleus/testing:cpp_test_utils",
         "@com_google_googletest//:gtest_main",
         "@org_tensorflow//tensorflow/core:lib",
         "@org_tensorflow//tensorflow/core:test",
@@ -134,11 +142,11 @@ cc_library(
     hdrs = ["variant_calling.h"],
     deps = [
         ":allelecounter",
-        "//deepvariant/core:cpp_math",
-        "//deepvariant/core:cpp_utils",
-        "//deepvariant/core:samplers",
-        "//deepvariant/core/genomics:variants_cc_pb2",
         "//deepvariant/protos:deepvariant_cc_pb2",
+        "//third_party/nucleus/protos:variants_cc_pb2",
+        "//third_party/nucleus/util:cpp_math",
+        "//third_party/nucleus/util:cpp_utils",
+        "//third_party/nucleus/util:samplers",
         "@org_tensorflow//tensorflow/core:lib",
         "@protobuf_archive//:protobuf",
     ],
@@ -151,11 +159,11 @@ cc_test(
     deps = [
         ":utils",
         ":variant_calling",
-        "//deepvariant/core:cpp_test_utils",
-        "//deepvariant/core:cpp_utils",
-        "//deepvariant/core/genomics:variants_cc_pb2",
         "//deepvariant/protos:deepvariant_cc_pb2",
-        "//deepvariant/testing:gunit_extras",
+        "//third_party/nucleus/protos:variants_cc_pb2",
+        "//third_party/nucleus/testing:cpp_test_utils",
+        "//third_party/nucleus/testing:gunit_extras",
+        "//third_party/nucleus/util:cpp_utils",
         "@com_google_googletest//:gtest_main",
         "@org_tensorflow//tensorflow/core:lib",
         "@org_tensorflow//tensorflow/core:test",
@@ -163,15 +171,17 @@ cc_test(
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "variant_caller",
     srcs = ["variant_caller.py"],
     srcs_version = "PY2AND3",
     deps = [
-        "//deepvariant/core:py_math",
-        "//deepvariant/core:variantutils",
-        "//deepvariant/core/genomics:variants_py_pb2",
         "//deepvariant/python:variant_calling",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:genomics_math",
+        "//third_party/nucleus/util:variant_utils",
+        "//third_party/nucleus/util:variantcall_utils",
+        "//third_party/nucleus/util:vcf_constants",
     ],
 )
 
@@ -181,12 +191,12 @@ py_test(
     srcs = ["variant_caller_test.py"],
     srcs_version = "PY2AND3",
     deps = [
-        ":py_test_utils",
+        ":py_testdata",
         ":variant_caller",
-        "//deepvariant/core:variantutils",
         "//deepvariant/protos:deepvariant_py_pb2",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
@@ -195,9 +205,9 @@ cc_library(
     srcs = ["utils.cc"],
     hdrs = ["utils.h"],
     deps = [
-        "//deepvariant/core:cpp_utils",
-        "//deepvariant/core/genomics:variants_cc_pb2",
         "//deepvariant/protos:deepvariant_cc_pb2",
+        "//third_party/nucleus/protos:variants_cc_pb2",
+        "//third_party/nucleus/util:cpp_utils",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
@@ -208,42 +218,47 @@ cc_test(
     srcs = ["utils_test.cc"],
     deps = [
         ":utils",
-        "//deepvariant/core:cpp_test_utils",
-        "//deepvariant/testing:gunit_extras",
+        "//third_party/nucleus/testing:cpp_test_utils",
+        "//third_party/nucleus/testing:gunit_extras",
         "@com_google_googletest//:gtest_main",
         "@org_tensorflow//tensorflow/core:test",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "make_examples_lib",
     srcs = ["make_examples.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":exclude_contigs",
         ":logging_level",
         ":pileup_image",
+        ":resources",
         ":tf_utils",
         ":variant_caller",
-        ":variant_labeler",
-        "//deepvariant/core:errors",
-        "//deepvariant/core:genomics_io",
-        "//deepvariant/core:htslib_gcp_oauth",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:proto_utils",
-        "//deepvariant/core:py_utils",
-        "//deepvariant/core:ranges",
-        "//deepvariant/core:variantutils",
-        "//deepvariant/core/protos:core_py_pb2",
-        "//deepvariant/core/python:hts_verbose",
+        "//deepvariant/labeler:customized_classes_labeler",
+        "//deepvariant/labeler:haplotype_labeler",
+        "//deepvariant/labeler:positional_labeler",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/python:allelecounter",
         "//deepvariant/realigner",
         "//deepvariant/vendor:timer",
-        "@com_google_absl_py//absl/logging",
+        "//third_party/nucleus/io:fasta",
+        "//third_party/nucleus/io:sam",
+        "//third_party/nucleus/io:vcf",
+        "//third_party/nucleus/io/python:hts_verbose",
+        "//third_party/nucleus/protos:reads_py_pb2",
+        "//third_party/nucleus/util:errors",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:proto_utils",
+        "//third_party/nucleus/util:py_utils",
+        "//third_party/nucleus/util:ranges",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
-py_binary(
+nucleus_py_binary(
     name = "make_examples",
     srcs = [
         "make_examples.py",
@@ -256,51 +271,56 @@ py_binary(
 
 py_test(
     name = "make_examples_test",
-    size = "medium",
+    size = "large",
     srcs = ["make_examples_test.py"],
     data = [":testdata"],
     shard_count = 2,
     srcs_version = "PY2AND3",
     deps = [
         ":make_examples",
-        ":py_test_utils",
+        ":py_testdata",
         ":tf_utils",
-        "//deepvariant/core:errors",
-        "//deepvariant/core:genomics_io",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:ranges",
-        "//deepvariant/core:variantutils",
-        "//deepvariant/core/genomics:variants_py_pb2",
-        "//deepvariant/core/protos:core_py_pb2",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/protos:realigner_py_pb2",
         "//deepvariant/testing:flagsaver",
-        "@com_google_absl_py//absl/logging",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//third_party/nucleus/io:vcf",
+        "//third_party/nucleus/protos:reads_py_pb2",
+        "//third_party/nucleus/protos:reference_py_pb2",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:errors",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:ranges",
+        "//third_party/nucleus/util:variant_utils",
+        "//third_party/nucleus/util:variantcall_utils",
+        "//third_party/nucleus/util:vcf_constants",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "call_variants_lib",
     srcs = ["call_variants.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":data_providers",
         ":logging_level",
         ":modeling",
         ":tf_utils",
-        "//deepvariant/core:errors",
-        "//deepvariant/core:htslib_gcp_oauth",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:proto_utils",
-        "//deepvariant/core:variantutils",
-        "//deepvariant/core/genomics:variants_py_pb2",
         "//deepvariant/protos:deepvariant_py_pb2",
-        "@com_google_absl_py//absl/logging",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:errors",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:proto_utils",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
-py_binary(
+nucleus_py_binary(
     name = "call_variants",
     srcs = [
         "call_variants.py",
@@ -308,6 +328,7 @@ py_binary(
     main = "call_variants.py",
     deps = [
         ":call_variants_lib",
+        "@io_abseil_py//absl/flags",
     ],
 )
 
@@ -315,20 +336,24 @@ py_test(
     name = "call_variants_test",
     size = "medium",
     srcs = ["call_variants_test.py"],
+    args = ["--use_tpu=false"],
     data = [":testdata"],
     srcs_version = "PY2AND3",
     deps = [
         ":call_variants",
         ":modeling",
-        ":py_test_utils",
+        ":py_testdata",
         ":tf_utils",
-        "//deepvariant/core:errors",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:variantutils",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/testing:flagsaver",
-        "@com_google_absl_py//absl/logging",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//deepvariant/testing:tf_test_utils",
+        "//third_party/nucleus/testing:py_test_utils",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
@@ -346,21 +371,23 @@ py_test(
     deps = [
         ":call_variants",
         ":modeling",
-        ":py_test_utils",
-        "@com_google_absl_py//absl/testing:parameterized",
+        ":py_testdata",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "pileup_image",
     srcs = ["pileup_image.py"],
     srcs_version = "PY2AND3",
     deps = [
-        "//deepvariant/core:py_utils",
-        "//deepvariant/core:ranges",
-        "//deepvariant/core/protos:core_py_pb2",
+        ":dv_constants",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/python:pileup_image_native",
+        "//third_party/nucleus/protos:reads_py_pb2",
+        "//third_party/nucleus/util:py_utils",
+        "//third_party/nucleus/util:ranges",
     ],
 )
 
@@ -372,14 +399,14 @@ py_test(
     srcs_version = "PY2AND3",
     deps = [
         ":pileup_image",
-        ":py_test_utils",
-        "//deepvariant/core:ranges",
-        "//deepvariant/core/genomics:variants_py_pb2",
-        "//deepvariant/core/python:reference_fai",
+        ":py_testdata",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/python:pileup_image_native",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//third_party/nucleus/io:fasta",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:ranges",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
@@ -388,37 +415,43 @@ cc_library(
     srcs = ["pileup_image_native.cc"],
     hdrs = ["pileup_image_native.h"],
     deps = [
-        "//deepvariant/core/genomics:cigar_cc_pb2",
-        "//deepvariant/core/genomics:position_cc_pb2",
-        "//deepvariant/core/genomics:reads_cc_pb2",
-        "//deepvariant/core/genomics:variants_cc_pb2",
-        "//deepvariant/core/protos:core_cc_pb2",
         "//deepvariant/protos:deepvariant_cc_pb2",
+        "//third_party/nucleus/protos:cigar_cc_pb2",
+        "//third_party/nucleus/protos:position_cc_pb2",
+        "//third_party/nucleus/protos:reads_cc_pb2",
+        "//third_party/nucleus/protos:variants_cc_pb2",
         "@org_tensorflow//tensorflow/core:lib",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "postprocess_variants_py_lib",
     srcs = ["postprocess_variants.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":dv_vcf_constants",
         ":logging_level",
-        "//deepvariant/core:errors",
-        "//deepvariant/core:genomics_io",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:proto_utils",
-        "//deepvariant/core:py_math",
-        "//deepvariant/core:variantutils",
-        "//deepvariant/core/genomics:variants_py_pb2",
-        "//deepvariant/core/protos:core_py_pb2",
+        "//deepvariant:haplotypes",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/python:postprocess_variants",
-        "@com_google_absl_py//absl/logging",
+        "//third_party/nucleus/io:fasta",
+        "//third_party/nucleus/io:vcf",
+        "//third_party/nucleus/protos:struct_py_pb2",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:errors",
+        "//third_party/nucleus/util:genomics_math",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:proto_utils",
+        "//third_party/nucleus/util:ranges",
+        "//third_party/nucleus/util:variant_utils",
+        "//third_party/nucleus/util:variantcall_utils",
+        "//third_party/nucleus/util:vcf_constants",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
-py_binary(
+nucleus_py_binary(
     name = "postprocess_variants",
     srcs = [
         "postprocess_variants.py",
@@ -426,6 +459,7 @@ py_binary(
     main = "postprocess_variants.py",
     deps = [
         ":postprocess_variants_py_lib",
+        "@io_abseil_py//absl/flags",
     ],
 )
 
@@ -436,93 +470,114 @@ py_test(
     data = [":testdata"],
     srcs_version = "PY2AND3",
     deps = [
-        ":postprocess_variants",
-        ":py_test_utils",
-        "//deepvariant/core:errors",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:py_math",
-        "//deepvariant/core/genomics:variants_py_pb2",
+        ":postprocess_variants_py_lib",
+        ":py_testdata",
         "//deepvariant/protos:deepvariant_py_pb2",
         "//deepvariant/testing:flagsaver",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//third_party/nucleus/io:fasta",
+        "//third_party/nucleus/protos:reference_py_pb2",
+        "//third_party/nucleus/protos:struct_py_pb2",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:errors",
+        "//third_party/nucleus/util:genomics_math",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:vcf_constants",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
-    name = "variant_labeler",
-    srcs = ["variant_labeler.py"],
-    srcs_version = "PY2AND3",
-    deps = [
-        "//deepvariant/core:variantutils",
-        "//deepvariant/core/genomics:variants_py_pb2",
-        "@com_google_absl_py//absl/logging",
-    ],
-)
-
-py_test(
-    name = "variant_labeler_test",
-    size = "small",
-    srcs = ["variant_labeler_test.py"],
-    data = [":testdata"],
-    srcs_version = "PY2AND3",
-    deps = [
-        ":py_test_utils",
-        ":variant_labeler",
-        "//deepvariant/core:ranges",
-        "//deepvariant/core:variantutils",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-    ],
-)
-
-py_library(
-    name = "py_test_utils",
+nucleus_py_library(
+    name = "py_testdata",
     testonly = True,
-    srcs = ["test_utils.py"],
+    srcs = ["testdata.py"],
     srcs_version = "PY2AND3",
     deps = [
-        "//deepvariant/core:py_test_utils",
+        "//third_party/nucleus/testing:py_test_utils",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "data_providers",
     srcs = ["data_providers.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":dv_constants",
         ":tf_utils",
-        "//deepvariant/core:io_utils",
         "//deepvariant/protos:deepvariant_py_pb2",
+        "//third_party/nucleus/util:io_utils",
         "@protobuf_archive//:protobuf_python",
+    ],
+)
+
+nucleus_py_library(
+    name = "data_providers_test_lib",
+    testonly = True,
+    srcs = ["data_providers_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":data_providers",
+        ":dv_constants",
+        ":modeling",
+        ":py_testdata",
+        "//deepvariant/protos:deepvariant_py_pb2",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
 py_test(
     name = "data_providers_test",
-    size = "small",
+    size = "medium",
     srcs = ["data_providers_test.py"],
     data = [":testdata"],
+    main = "data_providers_test.py",
     srcs_version = "PY2AND3",
     deps = [
-        ":data_providers",
-        ":modeling",
-        ":py_test_utils",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:variantutils",
-        "//deepvariant/protos:deepvariant_py_pb2",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        ":data_providers_test_lib",
     ],
 )
 
-py_library(
+nucleus_py_library(
+    name = "haplotypes",
+    srcs = ["haplotypes.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//third_party/nucleus/util:genomics_math",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
+    ],
+)
+
+py_test(
+    name = "haplotypes_test",
+    size = "small",
+    srcs = ["haplotypes_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":haplotypes",
+        ":py_testdata",
+        "//deepvariant/testing:flagsaver",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
+    ],
+)
+
+nucleus_py_library(
     name = "modeling",
     srcs = ["modeling.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":data_providers",
         ":tf_utils",
-        "@com_google_absl_py//absl/logging",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
         "@org_tensorflow_slim//:inception",
         "@org_tensorflow_slim//:mobilenet_v1",
         "@org_tensorflow_slim//:resnet_v2",
@@ -531,16 +586,18 @@ py_library(
 
 py_test(
     name = "modeling_test",
-    size = "small",
+    size = "medium",
     srcs = ["modeling_test.py"],
     srcs_version = "PY2AND3",
     deps = [
+        ":dv_constants",
         ":modeling",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "model_train_lib",
     srcs = ["model_train.py"],
     srcs_version = "PY2AND3",
@@ -548,17 +605,20 @@ py_library(
         ":data_providers",
         ":logging_level",
         ":modeling",
-        "//deepvariant/core:proto_utils",
-        "@com_google_absl_py//absl/logging",
+        "//third_party/nucleus/util:proto_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
-py_binary(
+nucleus_py_binary(
     name = "model_train",
     srcs = ["model_train.py"],
     srcs_version = "PY2AND3",
     deps = [
         ":model_train_lib",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
@@ -566,19 +626,24 @@ py_test(
     name = "model_train_test",
     size = "medium",
     srcs = ["model_train_test.py"],
+    data = [":testdata"],
+    shard_count = 10,
     srcs_version = "PY2AND3",
+    tags = ["nozapfhahn"],  # timeout
     deps = [
-        ":data_providers_test",
+        ":data_providers_test_lib",
         ":model_train",
         ":modeling",
-        ":py_test_utils",
+        ":py_testdata",
         "//deepvariant/testing:flagsaver",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//deepvariant/testing:tf_test_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "model_eval_lib",
     srcs = ["model_eval.py"],
     srcs_version = "PY2AND3",
@@ -586,46 +651,54 @@ py_library(
         ":data_providers",
         ":logging_level",
         ":modeling",
-        "//deepvariant/core:proto_utils",
-        "//deepvariant/core:variantutils",
-        "@com_google_absl_py//absl/logging",
+        "//third_party/nucleus/util:proto_utils",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
-py_binary(
+nucleus_py_binary(
     name = "model_eval",
     srcs = ["model_eval.py"],
     srcs_version = "PY2AND3",
     deps = [
         ":model_eval_lib",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/logging",
     ],
 )
 
 py_test(
     name = "model_eval_test",
-    size = "medium",
+    size = "large",
     srcs = ["model_eval_test.py"],
+    data = [":testdata"],
+    shard_count = 10,
     srcs_version = "PY2AND3",
     deps = [
-        ":data_providers_test",
+        ":data_providers_test_lib",
         ":model_eval",
-        ":modeling",
-        ":py_test_utils",
-        "//deepvariant/core:variantutils",
+        ":py_testdata",
         "//deepvariant/testing:flagsaver",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//deepvariant/testing:tf_test_utils",
+        "//third_party/nucleus/testing:py_test_utils",
+        "//third_party/nucleus/util:variant_utils",
+        "@io_abseil_py//absl/flags",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "tf_utils",
     srcs = ["tf_utils.py"],
     srcs_version = "PY2AND3",
     deps = [
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core:ranges",
-        "//deepvariant/core/genomics:variants_py_pb2",
         "//deepvariant/protos:deepvariant_py_pb2",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:io_utils",
+        "//third_party/nucleus/util:ranges",
     ],
 )
 
@@ -635,16 +708,80 @@ py_test(
     srcs = ["tf_utils_test.py"],
     srcs_version = "PY2AND3",
     deps = [
-        ":py_test_utils",
+        ":py_testdata",
         ":tf_utils",
-        "//deepvariant/core:io_utils",
-        "//deepvariant/core/genomics:variants_py_pb2",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:io_utils",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
     ],
 )
 
-py_library(
+nucleus_py_library(
     name = "logging_level",
     srcs = ["logging_level.py"],
+    deps = ["@io_abseil_py//absl/flags"],
+)
+
+nucleus_py_library(
+    name = "exclude_contigs",
+    srcs = ["exclude_contigs.py"],
+)
+
+py_test(
+    name = "exclude_contigs_test",
+    size = "small",
+    srcs = ["exclude_contigs_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":exclude_contigs",
+        "@io_abseil_py//absl/testing:absltest",
+    ],
+)
+
+nucleus_py_library(
+    name = "dv_constants",
+    srcs = ["dv_constants.py"],
+    srcs_version = "PY2AND3",
+    deps = [],
+)
+
+nucleus_py_library(
+    name = "dv_vcf_constants",
+    srcs = ["dv_vcf_constants.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//third_party/nucleus/protos:variants_py_pb2",
+        "//third_party/nucleus/util:vcf_constants",
+    ],
+)
+
+py_test(
+    name = "dv_vcf_constants_test",
+    size = "small",
+    srcs = ["dv_vcf_constants_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":dv_vcf_constants",
+        "//third_party/nucleus/protos:reference_py_pb2",
+        "@io_abseil_py//absl/testing:absltest",
+        "@io_abseil_py//absl/testing:parameterized",
+    ],
+)
+
+nucleus_py_binary(
+    name = "resources",
+    srcs = ["resources.py"],
+    srcs_version = "PY2AND3",
+    deps = ["//deepvariant/protos:resources_py_pb2"],
+)
+
+py_test(
+    name = "resources_test",
+    srcs = ["resources_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":resources",
+        "@io_abseil_py//absl/testing:absltest",
+    ],
 )

@@ -37,15 +37,23 @@ from __future__ import division
 from __future__ import print_function
 
 
+import numpy as np
 
 import tensorflow as tf
 
-from tensorflow.core.example import example_pb2
+from third_party.nucleus.protos import variants_pb2
 
-from deepvariant.core import io_utils
-from deepvariant.core import ranges
-from deepvariant.core.genomics import variants_pb2
+from third_party.nucleus.util import io_utils
+from third_party.nucleus.util import ranges
+from tensorflow.core.example import example_pb2
 from deepvariant.protos import deepvariant_pb2
+
+# Convert strings up to this length, then clip.  We picked a number that
+# was less than 1K, with a bit of extra space for the length element,
+# to give enough space without overflowing to a larger multiple of 128.
+STRING_TO_INT_MAX_CONTENTS_LEN = 1020
+# This is the length of the resulting buffer (including the length entry).
+STRING_TO_INT_BUFFER_LENGTH = STRING_TO_INT_MAX_CONTENTS_LEN + 1
 
 
 def example_locus(example):
@@ -81,7 +89,7 @@ def example_variant(example):
 
 def example_label(example):
   """Gets the label field from example as a string."""
-  return example.features.feature['label'].int64_list.value[0]
+  return int(example.features.feature['label'].int64_list.value[0])
 
 
 def example_image_format(example):
@@ -95,12 +103,6 @@ def example_image_shape(example):
     raise ValueError('Invalid image/shape: we expect to find an image/shape '
                      'field with length 3.')
   return example.features.feature['image/shape'].int64_list.value[0:3]
-
-
-def example_truth_variant(example):
-  """Gets and decodes the truth_variant field from example as a Variant."""
-  return variants_pb2.Variant.FromString(
-      example.features.feature['truth_variant/encoded'].bytes_list.value[0])
 
 
 def example_key(example):
@@ -123,25 +125,16 @@ def example_set_label(example, numeric_label):
   example.features.feature['label'].int64_list.value[:] = [numeric_label]
 
 
-def example_set_truth_variant(example, truth_variant, simplify=True):
-  """Sets the truth_variant feature of example to truth_variant.
-
-  The feature 'truth_variant' of example.features gets set to the serialized
-  version of truth_variant. If simplify is True, we strip out the fields of
-  truth_variant that aren't useful for training purposes (such as the INFO
-  field map). truth_variant isn't modified directly, regardless.
+def example_set_variant(example, variant):
+  """Sets the variant/encoded feature of example to variant.SerializeToString().
 
   Args:
     example: a tf.Example proto.
-    truth_variant: a
-      learning.genomics.deepvariant.core.genomics.Variant proto.
-    simplify: boolean. If True, we will simplify truth_variant before encoding
-      it. If False, truth_variant will be written out as is.
+    variant: third_party.nucleus.protos.Variant protobuf containing information
+      about a candidate variant call.
   """
-  if simplify:
-    truth_variant = _simplify_variant(truth_variant)
-  example.features.feature['truth_variant/encoded'].bytes_list.value[:] = [
-      truth_variant.SerializeToString()
+  example.features.feature['variant/encoded'].bytes_list.value[:] = [
+      variant.SerializeToString()
   ]
 
 
@@ -154,7 +147,13 @@ def _get_one_example_from_examples_path(source):
   for source_path in source_paths:
     files = tf.gfile.Glob(io_utils.NormalizeToShardedFilePattern(source_path))
     if not files:
-      raise ValueError('Unable to read shape from source {}'.format(source))
+      if len(source_paths) > 1:
+        raise ValueError(
+            'Cannot find matching files with the pattern "{}" in "{}"'.format(
+                source_path, ','.join(source_paths)))
+      else:
+        raise ValueError('Cannot find matching files with the pattern "{}"'
+                         .format(source_path))
     for f in files:
       try:
         return io_utils.read_tfrecords(f).next()
@@ -202,11 +201,16 @@ def _simplify_variant(variant):
       calls=[_simplify_variant_call(call) for call in variant.calls])
 
 
-def make_example(variant, alt_alleles, encoded_image, shape, image_format):
+def make_example(variant,
+                 alt_alleles,
+                 encoded_image,
+                 shape,
+                 image_format,
+                 second_image=None):
   """Creates a new tf.Example suitable for use with DeepVariant.
 
   Args:
-    variant: learning.genomics.deepvariant.core.genomics.Variant protobuf
+    variant: third_party.nucleus.protos.Variant protobuf
       containing information about a candidate variant call.
     alt_alleles: A set of strings. Indicates the alternate alleles used as "alt"
       when constructing the image.
@@ -215,6 +219,9 @@ def make_example(variant, alt_alleles, encoded_image, shape, image_format):
       consistent with the image_format argument.
     shape: a list of (width, height, channel).
     image_format: string. The scheme used to encode our image.
+    second_image: a Tensor of type tf.string or None. Contains second
+      image that encodes read data from another DNA sample. Must satisfy
+      the same requirements as encoded_image.
 
   Returns:
     A tf.Example proto containing the standard DeepVariant features.
@@ -225,8 +232,7 @@ def make_example(variant, alt_alleles, encoded_image, shape, image_format):
       ranges.to_literal(
           ranges.make_range(variant.reference_name, variant.start,
                             variant.end)))
-  features.feature['variant/encoded'].bytes_list.value.append(
-      variant.SerializeToString())
+  example_set_variant(example, variant)
   all_alts = list(variant.alternate_bases)
   alt_indices = sorted(all_alts.index(alt) for alt in alt_alleles)
 
@@ -237,6 +243,12 @@ def make_example(variant, alt_alleles, encoded_image, shape, image_format):
   features.feature['image/encoded'].bytes_list.value.append(encoded_image)
   features.feature['image/format'].bytes_list.value.append(image_format)
   features.feature['image/shape'].int64_list.value.extend(shape)
+  if second_image is not None:
+    features.feature['second_image/encoded'].bytes_list.value.append(
+        second_image)
+    features.feature['second_image/format'].bytes_list.value.append(
+        image_format)
+    features.feature['second_image/shape'].int64_list.value.extend(shape)
   return example
 
 
@@ -259,3 +271,73 @@ def model_shapes(checkpoint_path, variables_to_get=None):
   var_to_shape_map = reader.get_variable_to_shape_map()
   keys = variables_to_get if variables_to_get else var_to_shape_map.keys()
   return {key: tuple(var_to_shape_map[key]) for key in keys}
+
+
+def model_num_classes(checkpoint_path, n_classes_model_variable):
+  """Returns the number of classes in the checkpoint."""
+  if not checkpoint_path:
+    return None
+
+  # Figure out how many classes this inception model was trained to predict.
+  try:
+    shapes = model_shapes(checkpoint_path, [n_classes_model_variable])
+  except KeyError:
+    return None
+  if n_classes_model_variable not in shapes:
+    return None
+  return shapes[n_classes_model_variable][-1]
+
+
+def string_to_int_tensor(x):
+  """Graph operations decode a string into a fixed-size tensor of ints."""
+  decoded = tf.decode_raw(x, tf.uint8)
+  clipped = decoded[:STRING_TO_INT_MAX_CONTENTS_LEN]  # clip to allowed max_len
+  shape = tf.shape(clipped)
+  slen = shape[0]
+  # pad to desired max_len
+  padded = tf.pad(clipped, [[0, STRING_TO_INT_MAX_CONTENTS_LEN - slen]])
+  casted = tf.cast(padded, tf.int32)
+  casted.set_shape([STRING_TO_INT_MAX_CONTENTS_LEN])
+  return tf.concat([[slen], casted], 0)
+
+
+def int_tensor_to_string(x):
+  """Python operations to encode a tensor of ints into string of bytes."""
+  slen = x[0]
+  v = x[1:slen + 1]
+  return np.array(v, dtype=np.uint8).tostring()
+
+
+def compression_type_of_files(files):
+  """Return GZIP or None for the compression type of the files."""
+  reader_options = io_utils.make_tfrecord_options(files)
+  if reader_options.compression_type == (
+      tf.python_io.TFRecordCompressionType.GZIP):
+    return 'GZIP'
+  return None
+
+
+def tpu_available(sess=None):
+  """Return true if a TPU device is available to the default session."""
+  if sess is None:
+    init_op = tf.group(tf.global_variables_initializer(),
+                       tf.local_variables_initializer())
+    with tf.Session() as sess:
+      sess.run(init_op)
+      devices = sess.list_devices()
+  else:
+    devices = sess.list_devices()
+  return any(dev.device_type == 'TPU' for dev in devices)
+
+
+def resolve_master(master, tpu_name, tpu_zone, gcp_project):
+  """Resolve the master's URL given standard flags."""
+  if master is not None:
+    return master
+  elif tpu_name is not None:
+    tpu_cluster_resolver = (
+        tf.contrib.cluster_resolver.TPUClusterResolver(
+            tpu=[tpu_name], zone=tpu_zone, project=gcp_project))
+    return tpu_cluster_resolver.get_master()
+  else:
+    return ''

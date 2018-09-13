@@ -8,14 +8,19 @@ package(
     ],
 )
 
+# ------------------------------------------------------------------------------
+# deepvariant proto
+# ------------------------------------------------------------------------------
+
 proto_library(
     name = "deepvariant_proto",
     srcs = ["deepvariant.proto"],
     deps = [
         ":realigner_proto",  # NO COPYBARA
-        "//deepvariant/core/genomics:position_proto",  # NO COPYBARA
-        "//deepvariant/core/genomics:variants_proto",  # NO COPYBARA
-        "//deepvariant/core/protos:core_proto",  # NO COPYBARA
+        ":resources_proto",  # NO COPYBARA
+        "//third_party/nucleus/protos:position_proto",  # NO COPYBARA
+        "//third_party/nucleus/protos:reads_proto",  # NO COPYBARA
+        "//third_party/nucleus/protos:variants_proto",  # NO COPYBARA
     ],
 )
 
@@ -26,9 +31,10 @@ cc_proto_library(
     protoc = "@protobuf_archive//:protoc",
     deps = [
         ":realigner_cc_pb2",
-        "//deepvariant/core/genomics:position_cc_pb2",
-        "//deepvariant/core/genomics:variants_cc_pb2",
-        "//deepvariant/core/protos:core_cc_pb2",
+        ":resources_cc_pb2",
+        "//third_party/nucleus/protos:position_cc_pb2",
+        "//third_party/nucleus/protos:reads_cc_pb2",
+        "//third_party/nucleus/protos:variants_cc_pb2",
     ],
 )
 
@@ -40,9 +46,10 @@ py_proto_library(
     srcs_version = "PY2AND3",
     deps = [
         ":realigner_py_pb2",
-        "//deepvariant/core/genomics:position_py_pb2",
-        "//deepvariant/core/genomics:variants_py_pb2",
-        "//deepvariant/core/protos:core_py_pb2",
+        ":resources_py_pb2",
+        "//third_party/nucleus/protos:position_py_pb2",
+        "//third_party/nucleus/protos:reads_py_pb2",
+        "//third_party/nucleus/protos:variants_py_pb2",
     ],
 )
 
@@ -51,13 +58,17 @@ pyclif_proto_library(
     proto_lib = ":deepvariant_proto",  # NO COPYBARA
 )
 
+# ------------------------------------------------------------------------------
+# realigner proto
+# ------------------------------------------------------------------------------
+
 py_proto_library(
     name = "realigner_py_pb2",
     srcs = ["realigner.proto"],
     default_runtime = "@protobuf_archive//:protobuf_python",
     protoc = "@protobuf_archive//:protoc",
     srcs_version = "PY2AND3",
-    deps = ["//deepvariant/core/genomics:range_py_pb2"],
+    deps = ["//third_party/nucleus/protos:range_py_pb2"],
 )
 
 cc_proto_library(
@@ -65,16 +76,40 @@ cc_proto_library(
     srcs = ["realigner.proto"],
     default_runtime = "@protobuf_archive//:protobuf",
     protoc = "@protobuf_archive//:protoc",
-    deps = ["//deepvariant/core/genomics:range_cc_pb2"],
+    deps = ["//third_party/nucleus/protos:range_cc_pb2"],
 )
 
 proto_library(
     name = "realigner_proto",
     srcs = ["realigner.proto"],
-    deps = ["//deepvariant/core/genomics:range_proto"],  # NO COPYBARA
+    deps = ["//third_party/nucleus/protos:range_proto"],  # NO COPYBARA
 )
 
 pyclif_proto_library(
     name = "realigner_pyclif",
     proto_lib = ":realigner_proto",  # NO COPYBARA
+)
+
+# ------------------------------------------------------------------------------
+# resources proto
+# ------------------------------------------------------------------------------
+
+py_proto_library(
+    name = "resources_py_pb2",
+    srcs = ["resources.proto"],
+    default_runtime = "@protobuf_archive//:protobuf_python",
+    protoc = "@protobuf_archive//:protoc",
+    srcs_version = "PY2AND3",
+)
+
+cc_proto_library(
+    name = "resources_cc_pb2",
+    srcs = ["resources.proto"],
+    default_runtime = "@protobuf_archive//:protobuf",
+    protoc = "@protobuf_archive//:protoc",
+)
+
+proto_library(
+    name = "resources_proto",
+    srcs = ["resources.proto"],
 )

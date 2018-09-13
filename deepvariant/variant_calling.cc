@@ -34,33 +34,26 @@
 #include <algorithm>
 #include <numeric>
 
-#include "deepvariant/core/genomics/variants.pb.h"
-#include "deepvariant/core/math.h"
-#include "deepvariant/core/utils.h"
 #include "deepvariant/allelecounter.h"
 #include "deepvariant/protos/deepvariant.pb.h"
+#include "third_party/nucleus/protos/variants.pb.h"
+#include "third_party/nucleus/util/math.h"
+#include "third_party/nucleus/util/utils.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
-
-namespace {
-// Used for sorting RepeatedPtrField below.
-struct StringPtrLessThan {
-    bool operator() (const string* x, const string* y) const {
-          return *x < *y;
-    }
-};
-}
 
 namespace learning {
 namespace genomics {
 namespace deepvariant {
 
-using learning::genomics::v1::Variant;
-using learning::genomics::v1::VariantCall;
+using nucleus::genomics::v1::Variant;
+using nucleus::genomics::v1::VariantCall;
 using tensorflow::gtl::nullopt;
 using tensorflow::gtl::optional;
 using tensorflow::gtl::make_optional;
 using tensorflow::strings::StrCat;
+using tensorflow::string;
+
 
 // Declared in .h.
 const char* const kGVCFAltAllele = "<*>";
@@ -71,6 +64,15 @@ const char *const kVAFFormatField = "VAF";
 
 // The VCF/Variant allele string to use when you don't have any alt alleles.
 const char* const kNoAltAllele = ".";
+
+namespace {
+// Used for sorting RepeatedPtrField below.
+struct StringPtrLessThan {
+    bool operator() (const string* x, const string* y) const {
+          return *x < *y;
+    }
+};
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -189,7 +191,7 @@ std::vector<Allele> VariantCaller::SelectAltAlleles(
 // "GQ" key of info with a numerical value of gq, if provided) to variant.
 void AddGenotypes(const string& sample_name,
                   const std::vector<int>& genotypes, Variant* variant) {
-  CHECK_NOTNULL(variant);
+  CHECK(variant != nullptr);
 
   VariantCall* call = variant->add_calls();
   call->set_call_set_name(sample_name);
@@ -261,7 +263,7 @@ void AddReadDepths(const AlleleCount& allele_count, const AlleleMap& allele_map,
                    Variant* variant) {
   // Set the DP to the total good reads seen at this position.
   VariantCall* call = variant->mutable_calls(0);
-  core::SetInfoField(kDPFormatField, TotalAlleleCounts(allele_count), call);
+  nucleus::SetInfoField(kDPFormatField, TotalAlleleCounts(allele_count), call);
 
   if (variant->alternate_bases_size() == 1 &&
       (variant->alternate_bases(0) == kNoAltAllele ||
@@ -287,8 +289,8 @@ void AddReadDepths(const AlleleCount& allele_count, const AlleleMap& allele_map,
       vaf.push_back(1.0 * allele.count() / dp);
     }
 
-    core::SetInfoField(kADFormatField, ad, call);
-    core::SetInfoField(kVAFFormatField, vaf, call);
+    nucleus::SetInfoField(kADFormatField, ad, call);
+    nucleus::SetInfoField(kVAFFormatField, vaf, call);
   }
 }
 
@@ -320,7 +322,7 @@ std::vector<DeepVariantCall> VariantCaller::CallsFromAlleleCounts(
 
 optional<DeepVariantCall> VariantCaller::CallVariant(
     const AlleleCount& allele_count) const {
-  if (!core::AreCanonicalBases(allele_count.ref_base())) {
+  if (!nucleus::AreCanonicalBases(allele_count.ref_base())) {
     // We don't emit calls at any site in the genome that isn't one of the
     // canonical DNA bases (one of A, C, G, or T).
     return nullopt;

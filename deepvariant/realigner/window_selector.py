@@ -32,220 +32,194 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from collections import defaultdict
+from third_party.nucleus.protos import reads_pb2
+from third_party.nucleus.util import ranges
+from deepvariant.protos import deepvariant_pb2
+from deepvariant.protos import realigner_pb2
+from deepvariant.python import allelecounter
+from deepvariant.realigner.python import window_selector as cpp_window_selector
 
-from deepvariant.core.genomics import cigar_pb2
-from deepvariant.core.genomics import range_pb2
-from deepvariant.realigner import utils
+
+def _candidates_from_reads(config, ref_reader, reads, region):
+  """Returns a list of candidate positions.
+
+  Args:
+    config: learning.genomics.deepvariant.realigner.WindowSelectorOptions
+      options determining the behavior of this window selector.
+    ref_reader: GenomeReference. Indexed reference genome to query bases.
+    reads: list[nucleus.protos.Read]. The reads we are processing into
+      candidate positions.
+    region: nucleus.protos.Range. The region we are processing.
+
+  Returns:
+    A list. The elements are reference positions within region.
+
+  Raises:
+    ValueError: if config.window_selector_model.model_type isn't a valid enum
+    name in realigner_pb2.WindowSelectorModel.ModelType.
+  """
+  allele_counter_options = deepvariant_pb2.AlleleCounterOptions(
+      read_requirements=reads_pb2.ReadRequirements(
+          min_mapping_quality=config.min_mapq,
+          min_base_quality=config.min_base_quality))
+
+  expanded_region = ranges.expand(
+      region,
+      config.region_expansion_in_bp,
+      contig_map=ranges.contigs_dict(ref_reader.header.contigs))
+  allele_counter = allelecounter.AlleleCounter(
+      ref_reader.c_reader, expanded_region, allele_counter_options)
+
+  for read in reads:
+    allele_counter.add(read)
+
+  model_type = config.window_selector_model.model_type
+  if model_type == realigner_pb2.WindowSelectorModel.VARIANT_READS:
+    return _variant_reads_threshold_selector(
+        allele_counter, config.window_selector_model.variant_reads_model,
+        region, expanded_region)
+  elif model_type == realigner_pb2.WindowSelectorModel.ALLELE_COUNT_LINEAR:
+    return _allele_count_linear_selector(
+        allele_counter, config.window_selector_model.allele_count_linear_model,
+        region, expanded_region)
+  else:
+    raise ValueError('Unknown enum option "{}" for '
+                     'WindowSelectorModel.model_type'
+                     .format(config.window_selector_model.model_type))
 
 
-class WindowSelector(object):
-  """Provides a set of candidate genomic windows for local assembly."""
+def _variant_reads_threshold_selector(allele_counter, model_conf, region,
+                                      expanded_region):
+  """Returns a list of candidate positions.
 
-  def __init__(self, config):
-    """Initializations.
+  Following cigar operations generate candidate position:
+    - ALIGNMENT_MATCH, SEQUENCE_MISMATCH, SEQUENCE_MATCH: at mismatch positions
+      in the read when compared to the reference sequence.
+    - DELETE: at positions within [cigar_start, cigar_start + cigar_len)
+    - INSERT, CLIP_SOFT: at positions within
+        [cigar_start - cigar_len, cigar_start + cigar_len)
 
-    Args:
-      config: Realigner.RealignerOptions.WindowSelectorOptions record.
-    """
-    self.config = config
+  Args:
+    allele_counter: learning.genomics.deepvariant.realigner.AlleleCounter in the
+      considered region.
+    model_conf: learning.genomics.deepvariant.realigner
+      .WindowSelectorOptions.VariantReadsThresholdModel
+      options determining the behavior of this window selector.
+    region: nucleus.protos.Range. The region we are processing.
+    expanded_region: nucleus.protos.Range. The region we are processing.
 
-  def _process_align_match(self, cigar, ref, read, ref_pos, read_pos):
-    for _ in range(cigar.operation_length):
-      # Check for ref_pos ranges, if the read is partially overlapped with
-      # ref sequence, it might be out-of-range and result in index error.
-      if ref_pos >= len(ref):
-        break
-      if ref_pos >= 0:
-        if ref[ref_pos] != read.aligned_sequence[read_pos]:
-          if read.aligned_quality[read_pos] >= self.config.min_base_quality:
-            yield ref_pos
-      read_pos += 1
-      ref_pos += 1
+  Returns:
+    A list. The elements are reference positions within region.
+  """
 
-  def _process_seq_mismatch(self, cigar, ref, read, ref_pos, read_pos):
-    del ref  # Unused in processing cigar seq_mismatch operation.
-    for _ in range(cigar.operation_length):
-      if read.aligned_quality[read_pos] >= self.config.min_base_quality:
-        yield ref_pos
-      read_pos += 1
-      ref_pos += 1
+  counts_vec = cpp_window_selector.variant_reads_candidates_from_allele_counter(
+      allele_counter)
 
-  def _process_insert(self, cigar, ref, read, ref_pos, read_pos):
-    del ref  # Unused in processing cigar insert operation.
-    for i in range(cigar.operation_length):
-      if read.aligned_quality[read_pos] >= self.config.min_base_quality:
-        yield ref_pos + i
-        yield ref_pos - cigar.operation_length + i
-      read_pos += 1
+  return [
+      expanded_region.start + i
+      for i, count in enumerate(counts_vec)
+      if (count >= model_conf.min_num_supporting_reads and count <=
+          model_conf.max_num_supporting_reads and ranges.position_overlaps(
+              region.reference_name, expanded_region.start + i, region))
+  ]
 
-  def _process_soft_clip(self, cigar, ref, read, ref_pos, read_pos):
-    del ref  # Unused in processing cigar soft_clip operation.
-    if ref_pos == read.alignment.position.position:
-      offset = -cigar.operation_length
+
+def _allele_count_linear_selector(allele_counter, model_conf, region,
+                                  expanded_region):
+  """Returns a list of candidate positions.
+
+  Candidate positions for realignment are generated by scoring each location.
+  The score at a location is a weighted sum of the number of reads with each
+  CIGAR operation at the location, where the weights are determined by the model
+  coefficients. Locations whose score exceed the model decision boundary value
+  are used to create realignment windows.
+
+  Args:
+    allele_counter: learning.genomics.deepvariant.realigner.AlleleCounter in the
+      considered region.
+    model_conf: learning.genomics.deepvariant.realigner
+      .WindowSelectorOptions.AlleleCountLinearModel
+      options determining the behavior of this window selector.
+    region: nucleus.protos.Range. The region we are processing.
+    expanded_region: nucleus.protos.Range. The region we are processing.
+
+  Returns:
+    A list. The elements are reference positions within region.
+  """
+
+  scores_vec = (
+      cpp_window_selector.allele_count_linear_candidates_from_allele_counter(
+          allele_counter, model_conf))
+
+  return [
+      expanded_region.start + i
+      for i, score in enumerate(scores_vec)
+      if score > model_conf.decision_boundary and ranges.position_overlaps(
+          region.reference_name, expanded_region.start + i, region)
+  ]
+
+
+def _candidates_to_windows(config, candidate_pos, ref_name):
+  """"Process candidate positions to determine windows for local assembly.
+
+  Windows are within range of
+    [min(pos) - config.min_windows_distance,
+     max(pos) + config.min_windows_distance)
+
+  Args:
+    config: learning.genomics.deepvariant.realigner.WindowSelectorOptions
+      options determining the behavior of this window selector.
+    candidate_pos: A list of ref_pos.
+    ref_name: Reference name, used in setting the output
+      genomics.range.reference_name value.
+
+  Returns:
+    A sorted list of nucleus.protos.Range protos for all windows in this region.
+  """
+  windows = []
+
+  def _add_window(start_pos, end_pos):
+    windows.append(
+        ranges.make_range(ref_name, start_pos - config.min_windows_distance,
+                          end_pos + config.min_windows_distance))
+
+  start_pos, end_pos = None, None
+  for pos in sorted(candidate_pos):
+    if start_pos is None:
+      start_pos = pos
+      end_pos = pos
+    elif pos > end_pos + config.min_windows_distance:
+      _add_window(start_pos, end_pos)
+      start_pos = pos
+      end_pos = pos
     else:
-      offset = 0
-    for i in range(cigar.operation_length):
-      if read.aligned_quality[read_pos] >= self.config.min_base_quality:
-        yield ref_pos + offset + i
-      read_pos += 1
+      end_pos = pos
+  if start_pos is not None:
+    _add_window(start_pos, end_pos)
 
-  def _process_delete(self, cigar, ref, read, ref_pos, read_pos):
-    del ref, read, read_pos  # Unused in processing cigar delete operation.
-    for _ in range(cigar.operation_length):
-      yield ref_pos
-      ref_pos += 1
+  return sorted(windows, key=ranges.as_tuple)
 
-  def process_read(self, ref, read, ref_offset=0):
-    """Yields reference positions corresponding to read's variations.
 
-    Following cigar operations generate candidate position:
-      - ALIGNMENT_MATCH: at mismatch positions
-      - SEQUENCE_MISMATCH: at positions within
-          [cigar_start, cigar_start + cigar_len)
-      - DELETE: at positions within [cigar_start, cigar_start + cigar_len)
-      - INSERT: at positions within
-          [cigar_start - cigar_len, cigar_start + cigar_len)
-      - CLIP_SOFT: at positions within [cigar_start, cigar_start + cigar_len)
-      - SKIP: at positions within [cigar_start, cigar_start + cigar_len)
+def select_windows(config, ref_reader, reads, region):
+  """"Process reads to determine candidate windows for local assembly.
 
-    Following filters are applied:
-     - A read with low-quality alignment score is ignored.
-     - A variation position corresponding to a low quality base is ignored.
+  Windows are within range of
+    [0 - config.min_windows_distance, ref_len + config.min_windows_distance)
 
-    Args:
-      ref: reference sequence
-      read: A genomics.Read record.
-      ref_offset: Start offset for reference position.
+  Args:
+    config: learning.genomics.deepvariant.realigner.WindowSelectorOptions
+      options determining the behavior of this window selector.
+    ref_reader: GenomeReference. Indexed reference genome to query bases.
+    reads: A list of genomics.Read records.
+    region: nucleus.protos.Range. The region we are processing.
 
-    Yields:
-      reference positions within range of [0, seq_len], corresponding
-      to read's variations.
+  Returns:
+    A list of nucleus.protos.Range protos sorted by their genomic position.
+  """
+  # This is a fast path for the case where we have no reads, so we have no
+  # windows to assemble.
+  if not reads:
+    return []
 
-    Raises:
-      ValueError: for unsupported cigar operation.
-    """
-
-    if read.alignment.mapping_quality < self.config.min_mapq:
-      return
-
-    ref_pos = read.alignment.position.position - ref_offset
-    read_pos = 0
-    # Use set(), as some cigar operations might generate duplicated positions,
-    # E.g. for insertions, it extends the candidate positions to
-    # [ins_pos - ins_len, ins_pos + ins_len] which might overlap with some
-    # nearby mismatches.
-    positions = set()
-    for cigar in read.alignment.cigar:
-      # Break if it reached the end of reference sequence.
-      if ref_pos >= len(ref):
-        break
-      if cigar.operation not in utils.CIGAR_OPS:
-        raise ValueError('Unexpected CIGAR operation', cigar, read)
-
-      if cigar.operation == cigar_pb2.CigarUnit.ALIGNMENT_MATCH:
-        positions.update(
-            self._process_align_match(cigar, ref, read, ref_pos, read_pos))
-        read_pos += cigar.operation_length
-        ref_pos += cigar.operation_length
-      elif cigar.operation == cigar_pb2.CigarUnit.SEQUENCE_MISMATCH:
-        positions.update(
-            self._process_seq_mismatch(cigar, ref, read, ref_pos, read_pos))
-        read_pos += cigar.operation_length
-        ref_pos += cigar.operation_length
-      elif cigar.operation == cigar_pb2.CigarUnit.INSERT:
-        positions.update(
-            self._process_insert(cigar, ref, read, ref_pos, read_pos))
-        read_pos += cigar.operation_length
-      elif cigar.operation == cigar_pb2.CigarUnit.CLIP_SOFT:
-        positions.update(
-            self._process_soft_clip(cigar, ref, read, ref_pos, read_pos))
-        read_pos += cigar.operation_length
-      elif (cigar.operation == cigar_pb2.CigarUnit.DELETE or
-            cigar.operation == cigar_pb2.CigarUnit.SKIP):
-        positions.update(
-            self._process_delete(cigar, ref, read, ref_pos, read_pos))
-        ref_pos += cigar.operation_length
-      elif cigar.operation == cigar_pb2.CigarUnit.SEQUENCE_MATCH:
-        ref_pos += cigar.operation_length
-        read_pos += cigar.operation_length
-      elif (cigar.operation == cigar_pb2.CigarUnit.CLIP_HARD or
-            cigar.operation == cigar_pb2.CigarUnit.PAD):
-        pass
-
-    # Yield positions within the range
-    for pos in sorted(positions):
-      if pos >= 0 and pos < len(ref):
-        yield pos
-
-  def windows(self, candidate_pos, ref_name, ref_offset):
-    """"Process candidate positions to determine windows for local assembly.
-
-    Following filters are applied:
-      - Candidate position with low number of supporting reads is ignored.
-      - Candidate position with too many of supporting reads is ignored.
-
-    Windows are within range of
-      [min(pos) - self.config.min_windows_distance,
-       max(pos) + self.config.min_windows_distance)
-
-    Args:
-      candidate_pos: A dictionary with ref_pos as key and number of supporting
-        reads as its value.
-      ref_name: Reference name, used in setting the output
-        genomics.range.reference_name value.
-      ref_offset: Start offset for reference position.
-
-    Yields:
-      A genomics.range record. Note: only start and end fields are
-      populated.
-    """
-
-    start_pos = end_pos = -1
-    for pos in sorted(candidate_pos):
-      if candidate_pos[pos] < self.config.min_num_supporting_reads:
-        continue
-      if candidate_pos[pos] > self.config.max_num_supporting_reads:
-        continue
-      if start_pos == -1:
-        start_pos = pos
-        end_pos = pos
-      elif pos > end_pos + self.config.min_windows_distance:
-        yield range_pb2.Range(
-            reference_name=ref_name,
-            start=start_pos + ref_offset - self.config.min_windows_distance,
-            end=end_pos + ref_offset + self.config.min_windows_distance)
-        start_pos = pos
-        end_pos = pos
-      else:
-        end_pos = pos
-    if start_pos != -1:
-      yield range_pb2.Range(
-          reference_name=ref_name,
-          start=start_pos + ref_offset - self.config.min_windows_distance,
-          end=end_pos + ref_offset + self.config.min_windows_distance)
-
-  def process_reads(self, ref, reads, ref_name, ref_offset):
-    """"Process reads to determine candidate windows for local assembly.
-
-    Windows are within range of
-      [0 - self.config.min_windows_distance,
-       ref_len + self.config.min_windows_distance)
-
-    Args:
-      ref: reference sequence.
-      reads: A list of genomics.Read records.
-      ref_name: Reference name, used in setting output
-        genomics.range.reference_name values.
-      ref_offset: Start offset for reference position.
-
-    Returns:
-      A list of genomics.range records.
-    """
-    # A list of candidate positions mapping to their number of supporting reads.
-    candidates = defaultdict(int)
-
-    for read in reads:
-      for ref_pos in self.process_read(ref, read, ref_offset):
-        candidates[ref_pos] += 1
-    return self.windows(candidates, ref_name, ref_offset)
+  candidates = _candidates_from_reads(config, ref_reader, reads, region)
+  return _candidates_to_windows(config, candidates, region.reference_name)

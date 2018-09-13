@@ -38,25 +38,21 @@ import itertools
 
 import numpy as np
 
-from deepvariant.core import ranges
-from deepvariant.core import utils
-from deepvariant.core.protos import core_pb2
+from third_party.nucleus.protos import reads_pb2
+from third_party.nucleus.util import ranges
+from third_party.nucleus.util import utils
+from deepvariant import dv_constants
 from deepvariant.protos import deepvariant_pb2
 from deepvariant.python import pileup_image_native
-
-DEFAULT_MIN_BASE_QUALITY = 10
-DEFAULT_MIN_MAPPING_QUALITY = 10
-# redacted
-DEFAULT_NUM_CHANNEL = 7
 
 
 def default_options(read_requirements=None):
   """Creates a PileupImageOptions populated with good default values."""
   if not read_requirements:
-    read_requirements = core_pb2.ReadRequirements(
-        min_base_quality=DEFAULT_MIN_BASE_QUALITY,
-        min_mapping_quality=DEFAULT_MIN_MAPPING_QUALITY,
-        min_base_quality_mode=core_pb2.ReadRequirements.ENFORCED_BY_CLIENT)
+    read_requirements = reads_pb2.ReadRequirements(
+        min_base_quality=10,
+        min_mapping_quality=10,
+        min_base_quality_mode=reads_pb2.ReadRequirements.ENFORCED_BY_CLIENT)
 
   return deepvariant_pb2.PileupImageOptions(
       reference_band_height=5,
@@ -74,18 +70,14 @@ def default_options(read_requirements=None):
       negative_strand_color=240,
       base_quality_cap=40,
       mapping_quality_cap=60,
-      height=100,
-      width=221,
+      height=dv_constants.PILEUP_DEFAULT_HEIGHT,
+      width=dv_constants.PILEUP_DEFAULT_WIDTH,
+      num_channels=dv_constants.PILEUP_NUM_CHANNELS,
       read_overlap_buffer_bp=5,
       read_requirements=read_requirements,
       multi_allelic_mode=deepvariant_pb2.PileupImageOptions.ADD_HET_ALT_IMAGES,
       # Fixed random seed produced with 'od -vAn -N4 -tu4 < /dev/urandom'.
       random_seed=2101079370)
-
-
-def _empty_image_row(width):
-  """Creates an empty image row as an uint8 np.array."""
-  return np.zeros((1, width, DEFAULT_NUM_CHANNEL), dtype=np.uint8)
 
 
 def _compute_half_width(width):
@@ -176,11 +168,11 @@ class PileupImageCreator(object):
     """Gets the reads used to construct the pileup image around variant.
 
     Args:
-      variant: A learning.genomics.deepvariant.core.genomics.Variant proto
+      variant: A third_party.nucleus.protos.Variant proto
         describing the variant we are creating the pileup image of.
 
     Returns:
-      A list of learning.genomics.deepvariant.core.genomics.Read protos.
+      A list of third_party.nucleus.protos.Read protos.
     """
     query_start = variant.start - self._options.read_overlap_buffer_bp
     query_end = variant.end + self._options.read_overlap_buffer_bp
@@ -191,7 +183,7 @@ class PileupImageCreator(object):
     """Gets the reference bases used to make the pileup image around variant.
 
     Args:
-      variant: A learning.genomics.deepvariant.core.genomics.Variant proto
+      variant: A third_party.nucleus.protos.Variant proto
         describing the variant we are creating the pileup image of.
 
     Returns:
@@ -201,8 +193,8 @@ class PileupImageCreator(object):
     start = variant.start - self.half_width
     end = start + self._options.width
     region = ranges.make_range(variant.reference_name, start, end)
-    if self._ref_reader.is_valid_interval(region):
-      return self._ref_reader.bases(region)
+    if self._ref_reader.is_valid(region):
+      return self._ref_reader.query(region)
     else:
       return None
 
@@ -216,7 +208,7 @@ class PileupImageCreator(object):
     leaving us with the set of alts for the pileup image encoder.
 
     Args:
-      variant: learning.genomics.deepvariant.core.genomics.Variant to
+      variant: third_party.nucleus.protos.Variant to
         generate the alt allele combinations for.
 
     Yields:
@@ -250,7 +242,7 @@ class PileupImageCreator(object):
       refbases: A string options.width in length containing the reference base
         sequence to encode. The middle base of this string should be at the
         start of the variant in dv_call.
-      reads: Iterable of learning.genomics.deepvariant.core.genomics.Read
+      reads: Iterable of third_party.nucleus.protos.Read
         objects that we'll use to
         encode the read information supporting our call. Assumes each read is
         aligned and is well-formed (e.g., has bases and quality scores, cigar).
@@ -311,11 +303,15 @@ class PileupImageCreator(object):
     n_missing_rows = self.height - len(rows)
     if n_missing_rows > 0:
       # Add values to rows to fill it out with zeros.
-      rows += [_empty_image_row(len(refbases))] * n_missing_rows
+      rows += [self._empty_image_row()] * n_missing_rows
 
     # Vertically stack the image rows to create a single
     # h x w x DEFAULT_NUM_CHANNEL image.
     return np.vstack(rows)
+
+  def _empty_image_row(self):
+    """Creates an empty image row as an uint8 np.array."""
+    return np.zeros((1, self.width, self.num_channels), dtype=np.uint8)
 
   def create_pileup_images(self, dv_call):
     """Creates a DeepVariant TF.Example for the DeepVariant call dv_call.

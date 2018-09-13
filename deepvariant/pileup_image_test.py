@@ -40,11 +40,12 @@ import mock
 import numpy as np
 import numpy.testing as npt
 
+from third_party.nucleus.io import fasta
+from third_party.nucleus.protos import variants_pb2
+from third_party.nucleus.testing import test_utils
+from third_party.nucleus.util import ranges
+
 from deepvariant import pileup_image
-from deepvariant import test_utils
-from deepvariant.core import ranges
-from deepvariant.core.genomics import variants_pb2
-from deepvariant.core.python import reference_fai
 from deepvariant.protos import deepvariant_pb2
 from deepvariant.python import pileup_image_native
 
@@ -80,6 +81,9 @@ def _make_image_creator(ref_reader, sam_reader_obj, **kwargs):
 
 
 class PileupImageEncoderTest(parameterized.TestCase):
+
+  def setUp(self):
+    self.options = pileup_image.default_options()
 
   @parameterized.parameters(('A', 250), ('G', 180), ('T', 100), ('C', 30),
                             ('N', 0), ('X', 0))
@@ -159,9 +163,7 @@ class PileupImageEncoderTest(parameterized.TestCase):
             # Supports alt or not.
             (152, 152, 152, 152, 152),
             # Matches ref or not.
-            (50, 50, 50, 50, 50),
-            # Cigar operation length. 0 for reference.
-            (0, 0, 0, 0, 0)
+            (50, 50, 50, 50, 50)
         ]).astype(np.uint8))
 
   def assertImageRowEquals(self, image_row, expected):
@@ -185,9 +187,7 @@ class PileupImageEncoderTest(parameterized.TestCase):
         # Supports alt or not.
         (254, 254, 254, 254, 254),
         # Matches ref or not.
-        (50, 50, 254, 50, 50),
-        # Cigar operation length.
-        (5, 5, 5, 5, 5)
+        (50, 50, 254, 50, 50)
     ]).astype(np.uint8)
 
     self.assertImageRowEquals(_make_encoder().encode_read(
@@ -207,7 +207,6 @@ class PileupImageEncoderTest(parameterized.TestCase):
     read_start = bases_start_offset + bases_start
 
     # Create our expected image row encoding.
-    op_len = bases_end - bases_start
     full_expected = np.dstack([
         # Base.
         (250, 30, 30, 180, 100),
@@ -220,12 +219,10 @@ class PileupImageEncoderTest(parameterized.TestCase):
         # Supports alt or not.
         (254, 254, 254, 254, 254),
         # Matches ref or not.
-        (50, 50, 254, 50, 50),
-        # Cigar operation length.
-        [op_len] * 5
+        (50, 50, 254, 50, 50)
     ]).astype(np.uint8)
     expected = np.zeros(
-        (1, ref_size, pileup_image.DEFAULT_NUM_CHANNEL), dtype=np.uint8)
+        (1, ref_size, self.options.num_channels), dtype=np.uint8)
     for i in range(read_start, read_start + len(read_bases)):
       if ref_start <= i < ref_start + ref_size:
         expected[0, i - ref_start] = full_expected[0, i - ref_start]
@@ -261,9 +258,7 @@ class PileupImageEncoderTest(parameterized.TestCase):
         # Supports alt or not.
         (254, 254, 0, 0, 254),
         # Matches ref or not.
-        (50, 254, 0, 0, 50),
-        # Cigar operation length.
-        (2, 2, 0, 0, 1)
+        (50, 254, 0, 0, 50)
     ]).astype(np.uint8)
     self.assertImageRowEquals(_make_encoder().encode_read(
         dv_call, 'AACAG', read, start, alt_allele), full_expected)
@@ -292,9 +287,7 @@ class PileupImageEncoderTest(parameterized.TestCase):
         # Supports alt or not.
         (254, 254, 254, 254, 254),
         # Matches ref or not.
-        (50, 254, 50, 50, 50),
-        # Cigar operation length.
-        (2, 1, 3, 3, 3)
+        (50, 254, 50, 50, 50)
     ]).astype(np.uint8)
     self.assertImageRowEquals(_make_encoder().encode_read(
         dv_call, 'AACAG', read, start, alt_allele), full_expected)
@@ -310,7 +303,7 @@ class PileupImageEncoderTest(parameterized.TestCase):
     pie = _make_encoder()
 
     # Get the threshold the encoder uses.
-    min_qual = pileup_image.DEFAULT_MIN_BASE_QUALITY
+    min_qual = self.options.read_requirements.min_base_quality
 
     for qual in range(0, min_qual + 5):
       quals = [min_qual - 1, qual, min_qual + 1]
@@ -364,7 +357,7 @@ class PileupImageEncoderTest(parameterized.TestCase):
     expected_supports_alt_channel = [152, 254]
     expected = [
         expected_base_values[read_base], 254, 211, 70,
-        expected_supports_alt_channel[supports_alt], 254, 1
+        expected_supports_alt_channel[supports_alt], 254
     ]
 
     self.assertEqual(list(actual[0, 1]), expected)
@@ -386,21 +379,18 @@ class PileupImageCreatorEncodePileupTest(parameterized.TestCase):
 
     self.expected_rows = {
         'ref':
-            np.asarray(range(0, 21), np.uint8)
-            .reshape(1, 3, pileup_image.DEFAULT_NUM_CHANNEL),
+            np.asarray(range(0, 3 * self.pic.num_channels), np.uint8).reshape(
+                1, 3, self.pic.num_channels),
         'empty':
-            np.zeros((1, 3, pileup_image.DEFAULT_NUM_CHANNEL), dtype=np.uint8),
+            np.zeros((1, 3, self.pic.num_channels), dtype=np.uint8),
         'read1':
-            np.full(
-                (1, 3, pileup_image.DEFAULT_NUM_CHANNEL), 1, dtype=np.uint8),
+            np.full((1, 3, self.pic.num_channels), 1, dtype=np.uint8),
         'read2':
-            np.full(
-                (1, 3, pileup_image.DEFAULT_NUM_CHANNEL), 2, dtype=np.uint8),
+            np.full((1, 3, self.pic.num_channels), 2, dtype=np.uint8),
         'read3':
             None,
         'read4':
-            np.full(
-                (1, 3, pileup_image.DEFAULT_NUM_CHANNEL), 3, dtype=np.uint8),
+            np.full((1, 3, self.pic.num_channels), 3, dtype=np.uint8),
     }
 
     # Setup our shared mocks.
@@ -420,9 +410,8 @@ class PileupImageCreatorEncodePileupTest(parameterized.TestCase):
 
   def assertImageMatches(self, actual_image, *row_names):
     """Checks that actual_image matches an image from constructed row_names."""
-    self.assertEqual(
-        actual_image.shape,
-        (self.pic.height, self.pic.width, pileup_image.DEFAULT_NUM_CHANNEL))
+    self.assertEqual(actual_image.shape,
+                     (self.pic.height, self.pic.width, self.pic.num_channels))
     expected_image = np.vstack([self.expected_rows[name] for name in row_names])
     npt.assert_equal(actual_image, expected_image)
 
@@ -494,9 +483,9 @@ class PileupImageCreatorTest(parameterized.TestCase):
   def setUp(self):
     self.options = pileup_image.default_options()
     self.options.width = 5
-    self.mock_ref_reader = mock.MagicMock(spec=reference_fai.GenomeReferenceFai)
-    self.mock_ref_reader.bases.return_value = 'ACGT'
-    self.mock_ref_reader.is_valid_interval.return_value = True
+    self.mock_ref_reader = mock.MagicMock(spec=fasta.RefFastaReader)
+    self.mock_ref_reader.query.return_value = 'ACGT'
+    self.mock_ref_reader.is_valid.return_value = True
     self.mock_sam_reader = mock.MagicMock()
     self.mock_sam_reader.query.return_value = ['read1', 'read2']
     self.dv_call = _make_dv_call()
@@ -534,25 +523,23 @@ class PileupImageCreatorTest(parameterized.TestCase):
 
     actual = self.pic.get_reference_bases(self.variant)
     self.assertEqual('ACGT', actual)
-    self.mock_ref_reader.is_valid_interval.assert_called_once_with(region)
-    self.mock_ref_reader.bases.assert_called_once_with(region)
+    self.mock_ref_reader.is_valid.assert_called_once_with(region)
+    self.mock_ref_reader.query.assert_called_once_with(region)
 
   def test_get_reference_bases_bad_region_returns_none(self):
-    self.mock_ref_reader.is_valid_interval.return_value = False
+    self.mock_ref_reader.is_valid.return_value = False
     self.dv_call.variant.start = 3
 
     self.assertIsNone(self.pic.get_reference_bases(self.variant))
-    test_utils.assert_called_once_workaround(
-        self.mock_ref_reader.is_valid_interval)
-    self.mock_ref_reader.bases.assert_not_called()
+    test_utils.assert_called_once_workaround(self.mock_ref_reader.is_valid)
+    self.mock_ref_reader.query.assert_not_called()
 
   def test_create_pileup_image_returns_none_for_bad_region(self):
-    self.mock_ref_reader.is_valid_interval.return_value = False
+    self.mock_ref_reader.is_valid.return_value = False
     self.dv_call.variant.start = 3
     self.assertIsNone(self.pic.create_pileup_images(self.dv_call))
-    test_utils.assert_called_once_workaround(
-        self.mock_ref_reader.is_valid_interval)
-    self.mock_ref_reader.bases.assert_not_called()
+    test_utils.assert_called_once_workaround(self.mock_ref_reader.is_valid)
+    self.mock_ref_reader.query.assert_not_called()
 
   def test_create_pileup_image(self):
     self.dv_call.variant.alternate_bases[:] = ['C', 'T']
@@ -568,7 +555,7 @@ class PileupImageCreatorTest(parameterized.TestCase):
       ], self.pic.create_pileup_images(self.dv_call))
 
       def _expected_call(alts):
-        return mock.call(self.dv_call, self.mock_ref_reader.bases.return_value,
+        return mock.call(self.dv_call, self.mock_ref_reader.query.return_value,
                          self.mock_sam_reader.query.return_value, alts)
 
       self.assertEqual(mock_encoder.call_count, 3)

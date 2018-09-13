@@ -32,33 +32,38 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import copy
 import errno
+import platform
 import sys
 
 
 
+from absl import flags
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import mock
-import tensorflow as tf
 
-from absl import logging
-from tensorflow.core.example import example_pb2
-
+from third_party.nucleus.io import vcf
+from third_party.nucleus.protos import reads_pb2
+from third_party.nucleus.protos import reference_pb2
+from third_party.nucleus.protos import variants_pb2
+from third_party.nucleus.testing import test_utils
+from third_party.nucleus.util import io_utils
+from third_party.nucleus.util import ranges
+from third_party.nucleus.util import variant_utils
+from third_party.nucleus.util import variantcall_utils
+from third_party.nucleus.util import vcf_constants
 from deepvariant import make_examples
-from deepvariant import test_utils
+from deepvariant import testdata
 from deepvariant import tf_utils
-from deepvariant.core import genomics_io
-from deepvariant.core import io_utils
-from deepvariant.core import ranges
-from deepvariant.core import variantutils
-from deepvariant.core.genomics import variants_pb2
-from deepvariant.core.protos import core_pb2
+from deepvariant.labeler import variant_labeler
 from deepvariant.protos import deepvariant_pb2
 from deepvariant.protos import realigner_pb2
 from deepvariant.testing import flagsaver
 
-FLAGS = tf.flags.FLAGS
+FLAGS = flags.FLAGS
 
 # Dictionary mapping keys to decoders for decode_example function.
 _EXAMPLE_DECODERS = {
@@ -67,7 +72,6 @@ _EXAMPLE_DECODERS = {
     'image/encoded': tf_utils.example_encoded_image,
     'variant/encoded': tf_utils.example_variant,
     'label': tf_utils.example_label,
-    'truth_variant/encoded': tf_utils.example_truth_variant,
     'image/format': tf_utils.example_image_format,
     'image/shape': tf_utils.example_image_shape,
 }
@@ -96,7 +100,7 @@ def decode_example(example):
 
 
 def setUpModule():
-  test_utils.init()
+  testdata.init()
 
 
 def _make_contigs(specs):
@@ -113,12 +117,12 @@ def _make_contigs(specs):
   """
   if specs and len(specs[0]) == 3:
     return [
-        core_pb2.ContigInfo(name=name, n_bases=length, pos_in_fasta=i)
+        reference_pb2.ContigInfo(name=name, n_bases=length, pos_in_fasta=i)
         for name, length, i in specs
     ]
   else:
     return [
-        core_pb2.ContigInfo(name=name, n_bases=length, pos_in_fasta=i)
+        reference_pb2.ContigInfo(name=name, n_bases=length, pos_in_fasta=i)
         for i, (name, length) in enumerate(specs)
     ]
 
@@ -133,36 +137,42 @@ def _from_literals(literals, contig_map=None):
   return ranges.RangeSet.from_regions(literals, contig_map)
 
 
-def _variant_range_tuple(variant):
-  return variant.reference_name, variant.start, variant.end
-
-
-def _sort_candidates(candidates):
-  return list(sorted(candidates, key=lambda c: _variant_range_tuple(c.variant)))
-
-
-def _sort_variants(variants):
-  return list(sorted(variants, key=_variant_range_tuple))
-
-
-def _sharded(basename, num_shards):
+def _sharded(basename, num_shards=None):
   if num_shards:
     return basename + '@' + str(num_shards)
   else:
     return basename
 
 
-@parameterized.parameters((mode, num_shards)
-                          for mode in ['training', 'calling']
-                          for num_shards in [0, 3])
 class MakeExamplesEnd2EndTest(parameterized.TestCase):
 
+  # Golden sets are created with learning/genomics/internal/create_golden.sh
+  @parameterized.parameters(
+      # All tests are run with fast_pass_aligner enabled. There are no
+      # golden sets version for ssw realigner.
+      dict(mode='calling', num_shards=0),
+      dict(mode='calling', num_shards=3),
+      dict(
+          mode='training', num_shards=0, labeler_algorithm='haplotype_labeler'),
+      dict(
+          mode='training', num_shards=3, labeler_algorithm='haplotype_labeler'),
+      dict(
+          mode='training', num_shards=0,
+          labeler_algorithm='positional_labeler'),
+      dict(
+          mode='training', num_shards=3,
+          labeler_algorithm='positional_labeler'),
+  )
   @flagsaver.FlagSaver
-  def test_make_examples_end2end(self, mode, num_shards):
+  def test_make_examples_end2end(self,
+                                 mode,
+                                 num_shards,
+                                 labeler_algorithm=None,
+                                 use_fast_pass_aligner=True):
     self.assertIn(mode, {'calling', 'training'})
     region = ranges.parse_literal('chr20:10,000,000-10,010,000')
-    FLAGS.ref = test_utils.CHR20_FASTA
-    FLAGS.reads = test_utils.CHR20_BAM
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
     FLAGS.candidates = test_utils.test_tmpfile(
         _sharded('vsc.tfrecord', num_shards))
     FLAGS.examples = test_utils.test_tmpfile(
@@ -170,24 +180,38 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
     FLAGS.regions = [ranges.to_literal(region)]
     FLAGS.partition_size = 1000
     FLAGS.mode = mode
+    FLAGS.gvcf_gq_binsize = 5
+    FLAGS.use_fast_pass_aligner = use_fast_pass_aligner
+    if labeler_algorithm is not None:
+      FLAGS.labeler_algorithm = labeler_algorithm
 
     if mode == 'calling':
       FLAGS.gvcf = test_utils.test_tmpfile(
           _sharded('gvcf.tfrecord', num_shards))
     else:
-      FLAGS.truth_variants = test_utils.TRUTH_VARIANTS_VCF
-      FLAGS.confident_regions = test_utils.CONFIDENT_REGIONS_BED
+      FLAGS.truth_variants = testdata.TRUTH_VARIANTS_VCF
+      FLAGS.confident_regions = testdata.CONFIDENT_REGIONS_BED
 
     for task_id in range(max(num_shards, 1)):
       FLAGS.task = task_id
       options = make_examples.default_options(add_flags=True)
       make_examples.make_examples_runner(options)
 
+      # Check that our run_info proto contains the basic fields we'd expect:
+      # (a) our options are written to the run_info.options field.
+      run_info = make_examples.read_make_examples_run_info(
+          options.run_info_filename)
+      self.assertEqual(run_info.options, options)
+      # (b) run_info.resource_metrics is present and contains our hostname.
+      self.assertTrue(run_info.HasField('resource_metrics'))
+      self.assertEqual(run_info.resource_metrics.host_name, platform.node())
+
     # Test that our candidates are reasonable, calling specific helper functions
     # to check lots of properties of the output.
-    candidates = _sort_candidates(
+    candidates = sorted(
         io_utils.read_tfrecords(
-            FLAGS.candidates, proto=deepvariant_pb2.DeepVariantCall))
+            FLAGS.candidates, proto=deepvariant_pb2.DeepVariantCall),
+        key=lambda c: variant_utils.variant_range_tuple(c.variant))
     self.verify_deepvariant_calls(candidates, options)
     self.verify_variants(
         [call.variant for call in candidates], region, options, is_gvcf=False)
@@ -203,22 +227,62 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
     # calling modes to produce deterministic order because we fix the random
     # seed.
     if mode == 'calling':
-      golden_file = _sharded(test_utils.GOLDEN_CALLING_EXAMPLES, num_shards)
+      golden_file = _sharded(testdata.GOLDEN_CALLING_EXAMPLES, num_shards)
     else:
-      golden_file = _sharded(test_utils.GOLDEN_TRAINING_EXAMPLES, num_shards)
+      golden_file = _sharded(testdata.GOLDEN_TRAINING_EXAMPLES, num_shards)
     self.assertDeepVariantExamplesEqual(
         examples, list(io_utils.read_tfrecords(golden_file)))
 
     if mode == 'calling':
-      nist_reader = genomics_io.make_vcf_reader(test_utils.TRUTH_VARIANTS_VCF)
+      nist_reader = vcf.VcfReader(testdata.TRUTH_VARIANTS_VCF)
       nist_variants = list(nist_reader.query(region))
       self.verify_nist_concordance(example_variants, nist_variants)
 
       # Check the quality of our generated gvcf file.
-      gvcfs = _sort_variants(
+      gvcfs = variant_utils.sorted_variants(
           io_utils.read_tfrecords(FLAGS.gvcf, proto=variants_pb2.Variant))
       self.verify_variants(gvcfs, region, options, is_gvcf=True)
       self.verify_contiguity(gvcfs, region)
+      gvcf_golden_file = _sharded(testdata.GOLDEN_POSTPROCESS_GVCF_INPUT,
+                                  num_shards)
+      expected_gvcfs = list(
+          io_utils.read_tfrecords(gvcf_golden_file, proto=variants_pb2.Variant))
+      self.assertItemsEqual(gvcfs, expected_gvcfs)
+
+    if (mode == 'training' and num_shards == 0 and
+        labeler_algorithm != 'positional_labeler'):
+      # The positional labeler doesn't track metrics, so don't try to read them
+      # in when that's the mode.
+      self.assertEqual(
+          make_examples.read_make_examples_run_info(
+              testdata.GOLDEN_MAKE_EXAMPLES_RUN_INFO).labeling_metrics,
+          run_info.labeling_metrics)
+
+  # Golden sets are created with learning/genomics/internal/create_golden.sh
+  @flagsaver.FlagSaver
+  def test_make_examples_training_end2end_with_customized_classes_labeler(self):
+    FLAGS.labeler_algorithm = 'customized_classes_labeler'
+    FLAGS.customized_classes_labeler_classes_list = 'ref,class1,class2'
+    FLAGS.customized_classes_labeler_info_field_name = 'type'
+    region = ranges.parse_literal('20:10,000,000-10,010,000')
+    FLAGS.regions = [ranges.to_literal(region)]
+    FLAGS.ref = testdata.NOCHR_FASTA
+    FLAGS.reads = testdata.NOCHR_BAM
+    FLAGS.candidates = test_utils.test_tmpfile(_sharded('vsc.tfrecord'))
+    FLAGS.examples = test_utils.test_tmpfile(_sharded('examples.tfrecord'))
+    FLAGS.partition_size = 1000
+    FLAGS.mode = 'training'
+    FLAGS.gvcf_gq_binsize = 5
+    FLAGS.truth_variants = testdata.CUSTOMIZED_CLASSES_VARIANTS
+    FLAGS.confident_regions = testdata.CUSTOMIZED_CLASSES_REGIONS
+    options = make_examples.default_options(add_flags=True)
+    make_examples.make_examples_runner(options)
+    golden_file = _sharded(testdata.CUSTOMIZED_CLASSES_GOLDEN_TRAINING_EXAMPLES)
+    # Verify that the variants in the examples are all good.
+    examples = self.verify_examples(
+        FLAGS.examples, region, options, verify_labels=True)
+    self.assertDeepVariantExamplesEqual(
+        examples, list(io_utils.read_tfrecords(golden_file)))
 
   def verify_nist_concordance(self, candidates, nist_variants):
     # Tests that we call all of the real variants (according to NIST's Genome
@@ -273,7 +337,7 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
       self.assertLessEqual(variant.start, region.end)
       self.assertEqual(len(variant.calls), 1)
 
-      call = variant.calls[0]
+      call = variant_utils.only_call(variant)
       self.assertEqual(call.call_set_name,
                        options.variant_caller_options.sample_name)
       if is_gvcf:
@@ -281,10 +345,7 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
         # have genotype likelihoods and a GQ value.
         self.assertEqual(call.genotype, [0, 0])
         self.assertEqual(len(call.genotype_likelihood), 3)
-        self.assertGreaterEqual(
-            variantutils.genotype_quality(variant, default=None), 0)
-      else:
-        self.assertEqual(call.genotype, [-1, -1])
+        self.assertGreaterEqual(variantcall_utils.get_gq(call), 0)
 
   def verify_contiguity(self, contiguous_variants, region):
     """Verifies region is fully covered by gvcf records."""
@@ -295,7 +356,7 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
     self.assertEqual(region.end, contiguous_variants[-1].end)
 
     # After this loop completes successfully we know that together the GVCF and
-    # Variants form a fully contingous cover of our calling interval, as
+    # Variants form a fully contiguous cover of our calling interval, as
     # expected.
     for v1, v2 in zip(contiguous_variants, contiguous_variants[1:]):
       # Sequential variants should be contiguous, meaning that v2.start should
@@ -318,7 +379,7 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
     for call in dv_calls:
       for alt_allele in call.variant.alternate_bases:
         # Skip ref calls.
-        if alt_allele == variantutils.NO_ALT_ALLELE:
+        if alt_allele == vcf_constants.NO_ALT_ALLELE:
           continue
         # Make sure allele appears in our allele_support field and that at
         # least our min number of reads to call an alt allele are present in
@@ -330,26 +391,19 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
 
   def verify_examples(self, examples_filename, region, options, verify_labels):
     # Do some simple structural checks on the tf.Examples in the file.
-    expected_labels = [
+    expected_features = [
         'variant/encoded', 'locus', 'image/format', 'image/encoded',
         'alt_allele_indices/encoded'
     ]
     if verify_labels:
-      expected_labels += ['label', 'truth_variant/encoded']
+      expected_features += ['label']
 
     examples = list(io_utils.read_tfrecords(examples_filename))
     for example in examples:
-      for label_feature in expected_labels:
+      for label_feature in expected_features:
         self.assertIn(label_feature, example.features.feature)
       # pylint: disable=g-explicit-length-test
       self.assertGreater(len(tf_utils.example_alt_alleles_indices(example)), 0)
-
-      if verify_labels:
-        # Check that our variant and our truth_variant both have the same start.
-        self.assertEqual(
-            variantutils.variant_position(tf_utils.example_variant(example)),
-            variantutils.variant_position(
-                tf_utils.example_truth_variant(example)))
 
     # Check that the variants in the examples are good.
     variants = [tf_utils.example_variant(x) for x in examples]
@@ -360,12 +414,59 @@ class MakeExamplesEnd2EndTest(parameterized.TestCase):
 
 class MakeExamplesUnitTest(parameterized.TestCase):
 
+  def test_read_write_run_info(self):
+
+    def _read_lines(path):
+      with open(path) as fin:
+        return list(fin.readlines())
+
+    golden_actual = make_examples.read_make_examples_run_info(
+        testdata.GOLDEN_MAKE_EXAMPLES_RUN_INFO)
+    # We don't really want to inject too much knowledge about the golden right
+    # here, so we only use a minimal test that (a) the run_info_filename is
+    # a non-empty string and (b) the number of candidates sites in the labeling
+    # metrics field is greater than 0. Any reasonable golden output will have at
+    # least one candidate variant, and the reader should have filled in the
+    # value.
+    self.assertGreater(len(golden_actual.options.run_info_filename), 0)
+    self.assertEqual(golden_actual.labeling_metrics.n_candidate_variant_sites,
+                     testdata.N_GOLDEN_TRAINING_EXAMPLES)
+
+    # Check that reading + writing the data produces the same lines:
+    tmp_output = test_utils.test_tmpfile('written_run_info.pbtxt')
+    make_examples.write_make_examples_run_info(golden_actual, tmp_output)
+    self.assertEqual(
+        _read_lines(testdata.GOLDEN_MAKE_EXAMPLES_RUN_INFO),
+        _read_lines(tmp_output))
+
+  @parameterized.parameters(
+      dict(
+          flag_value='CALLING',
+          expected=deepvariant_pb2.DeepVariantOptions.CALLING,
+      ),
+      dict(
+          flag_value='TRAINING',
+          expected=deepvariant_pb2.DeepVariantOptions.TRAINING,
+      ),
+  )
+  def test_parse_proto_enum_flag(self, flag_value, expected):
+    enum_pb2 = deepvariant_pb2.DeepVariantOptions.Mode
+    self.assertEqual(
+        make_examples.parse_proto_enum_flag(enum_pb2, flag_value), expected)
+
+  def test_parse_proto_enum_flag_error_handling(self):
+    with self.assertRaisesRegexp(
+        ValueError,
+        'Unknown enum option "foo". Allowed options are CALLING,TRAINING'):
+      make_examples.parse_proto_enum_flag(
+          deepvariant_pb2.DeepVariantOptions.Mode, 'foo')
+
   @flagsaver.FlagSaver
   def test_default_options_with_training_random_emit_ref_sites(self):
-    FLAGS.ref = test_utils.CHR20_FASTA
-    FLAGS.reads = test_utils.CHR20_BAM
-    FLAGS.truth_variants = test_utils.TRUTH_VARIANTS_VCF
-    FLAGS.confident_regions = test_utils.CONFIDENT_REGIONS_BED
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
+    FLAGS.truth_variants = testdata.TRUTH_VARIANTS_VCF
+    FLAGS.confident_regions = testdata.CONFIDENT_REGIONS_BED
     FLAGS.mode = 'training'
     FLAGS.examples = ''
 
@@ -376,10 +477,10 @@ class MakeExamplesUnitTest(parameterized.TestCase):
 
   @flagsaver.FlagSaver
   def test_default_options_without_training_random_emit_ref_sites(self):
-    FLAGS.ref = test_utils.CHR20_FASTA
-    FLAGS.reads = test_utils.CHR20_BAM
-    FLAGS.truth_variants = test_utils.TRUTH_VARIANTS_VCF
-    FLAGS.confident_regions = test_utils.CONFIDENT_REGIONS_BED
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
+    FLAGS.truth_variants = testdata.TRUTH_VARIANTS_VCF
+    FLAGS.confident_regions = testdata.CONFIDENT_REGIONS_BED
     FLAGS.mode = 'training'
     FLAGS.examples = ''
 
@@ -390,12 +491,50 @@ class MakeExamplesUnitTest(parameterized.TestCase):
     self.assertEqual(
         options.variant_caller_options.fraction_reference_sites_to_emit, 0.0)
 
+  def test_extract_sample_name_from_reads_single_sample(self):
+    mock_sample_reader = mock.Mock()
+    mock_sample_reader.header = reads_pb2.SamHeader(
+        read_groups=[reads_pb2.ReadGroup(sample_id='sample_name')])
+    self.assertEqual(
+        make_examples.extract_sample_name_from_sam_reader(mock_sample_reader),
+        'sample_name')
+
+  @parameterized.parameters(
+      # No samples could be found in the reads.
+      dict(
+          samples=[],
+          expected_error_message='No non-empty sample name found in the input '
+          'reads. Please provide the name of the sample with the --sample_name '
+          'argument.'),
+      # Check that we detect an empty sample name and raise an exception.
+      dict(
+          samples=[''],
+          expected_error_message='No non-empty sample name found in the input '
+          'reads. Please provide the name of the sample '
+          'with the --sample_name argument.'),
+      # We have more than one sample in the reads.
+      dict(
+          samples=['sample1', 'sample2'],
+          expected_error_message=
+          r'Multiple samples \(sample1, sample2\) were found in the input '
+          'reads. DeepVariant can only call variants from a BAM file '
+          'containing a single sample.'),
+  )
+  def test_extract_sample_name_from_reads_detects_bad_samples(
+      self, samples, expected_error_message):
+    mock_sample_reader = mock.Mock()
+    mock_sample_reader.header = reads_pb2.SamHeader(read_groups=[
+        reads_pb2.ReadGroup(sample_id=sample) for sample in samples
+    ])
+    with self.assertRaisesRegexp(ValueError, expected_error_message):
+      make_examples.extract_sample_name_from_sam_reader(mock_sample_reader)
+
   @flagsaver.FlagSaver
   def test_confident_regions(self):
-    FLAGS.ref = test_utils.CHR20_FASTA
-    FLAGS.reads = test_utils.CHR20_BAM
-    FLAGS.truth_variants = test_utils.TRUTH_VARIANTS_VCF
-    FLAGS.confident_regions = test_utils.CONFIDENT_REGIONS_BED
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
+    FLAGS.truth_variants = testdata.TRUTH_VARIANTS_VCF
+    FLAGS.confident_regions = testdata.CONFIDENT_REGIONS_BED
     FLAGS.mode = 'training'
     FLAGS.examples = ''
 
@@ -545,21 +684,6 @@ class MakeExamplesUnitTest(parameterized.TestCase):
             [_make_contigs(contigs) for contigs in contigs_list]))
 
   @parameterized.parameters(
-      # all intervals are shared.
-      ([('chrM', 10)], ['chrM', 'MT'], []),
-      # One common interval and one not.
-      ([('chrM', 10), ('chr1', 20)], ['chrM', 'MT'], [('chr1', 20, 1)]),
-      ([('chrM', 10), ('chr1', 20)], ['chr1', 'MT'], [('chrM', 10)]),
-      ([('chrM', 10), ('chr1', 20)], ['chrM', 'chr1'], []),
-      ([('chrM', 10), ('chr1', 20)], ['chr2'], [('chrM', 10), ('chr1', 20)]),
-  )
-  def test_common_contigs_exclude_contigs(self, contigs, excludes, expected):
-    self.assertEqual(
-        _make_contigs(expected),
-        make_examples.common_contigs(
-            [_make_contigs(contigs)], exclude_contig_names=excludes))
-
-  @parameterized.parameters(
       # Note that these tests aren't so comprehensive as we are trusting that
       # the intersection code logic itself is good and well-tested elsewhere.
       # Here we are focusing on some basic tests and handling of missing
@@ -598,6 +722,41 @@ class MakeExamplesUnitTest(parameterized.TestCase):
         _from_literals_list(expected),
         make_examples.regions_to_process(
             contigs, max_size, calling_regions=_from_literals(calling_regions)))
+
+  @parameterized.parameters(
+      dict(includes=[], excludes=[], expected=['1:1-100', '2:1-200']),
+      dict(includes=['1'], excludes=[], expected=['1:1-100']),
+      # Check that excludes work as expected.
+      dict(includes=[], excludes=['1'], expected=['2:1-200']),
+      dict(includes=[], excludes=['2'], expected=['1:1-100']),
+      dict(includes=[], excludes=['1', '2'], expected=[]),
+      # Check that excluding pieces works. The main checks on taking the
+      # difference between two RangeSets live in ranges.py so here we are just
+      # making sure some basic logic works.
+      dict(includes=['1'], excludes=['1:1-10'], expected=['1:11-100']),
+      # Check that includes and excludes work together.
+      dict(
+          includes=['1', '2'],
+          excludes=['1:5-10', '1:20-50', '2:10-20'],
+          expected=['1:1-4', '1:11-19', '1:51-100', '2:1-9', '2:21-200']),
+      dict(
+          includes=['1'],
+          excludes=['1:5-10', '1:20-50', '2:10-20'],
+          expected=['1:1-4', '1:11-19', '1:51-100']),
+      dict(
+          includes=['2'],
+          excludes=['1:5-10', '1:20-50', '2:10-20'],
+          expected=['2:1-9', '2:21-200']),
+      # A complex example of including and excluding.
+      dict(
+          includes=['1:10-20', '2:50-60', '2:70-80'],
+          excludes=['1:1-13', '1:19-50', '2:10-65'],
+          expected=['1:14-18', '2:70-80']),
+  )
+  def test_build_calling_regions(self, includes, excludes, expected):
+    contigs = _make_contigs([('1', 100), ('2', 200)])
+    actual = make_examples.build_calling_regions(contigs, includes, excludes)
+    self.assertCountEqual(actual, _from_literals_list(expected))
 
   def test_regions_to_process_sorted_within_contig(self):
     # These regions are out of order but within a single contig.
@@ -676,14 +835,14 @@ class MakeExamplesUnitTest(parameterized.TestCase):
   def test_catches_bad_flags(self):
     # Set all of the requested flag values.
     region = ranges.parse_literal('chr20:10,000,000-10,010,000')
-    FLAGS.ref = test_utils.CHR20_FASTA
-    FLAGS.reads = test_utils.CHR20_BAM
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
     FLAGS.candidates = test_utils.test_tmpfile('vsc.tfrecord')
     FLAGS.examples = test_utils.test_tmpfile('examples.tfrecord')
     FLAGS.regions = [ranges.to_literal(region)]
     FLAGS.partition_size = 1000
     FLAGS.mode = 'training'
-    FLAGS.truth_variants = test_utils.TRUTH_VARIANTS_VCF
+    FLAGS.truth_variants = testdata.TRUTH_VARIANTS_VCF
     # This is the bad flag.
     FLAGS.confident_regions = ''
 
@@ -694,6 +853,107 @@ class MakeExamplesUnitTest(parameterized.TestCase):
         'confident_regions is required when in training mode.')
     mock_exit.assert_called_once_with(errno.ENOENT)
 
+  @parameterized.parameters(
+      dict(
+          ref_names=['1', '2', '3'],
+          sam_names=['1', '2', '3'],
+          vcf_names=None,
+          names_to_exclude=[],
+          min_coverage_fraction=1.0,
+          expected_names=['1', '2', '3']),
+      dict(
+          ref_names=['1', '2', '3'],
+          sam_names=['1', '2'],
+          vcf_names=None,
+          names_to_exclude=[],
+          min_coverage_fraction=0.66,
+          expected_names=['1', '2']),
+      dict(
+          ref_names=['1', '2', '3'],
+          sam_names=['1', '2'],
+          vcf_names=['1', '3'],
+          names_to_exclude=[],
+          min_coverage_fraction=0.33,
+          expected_names=['1']),
+      dict(
+          ref_names=['1', '2', '3', '4', '5'],
+          sam_names=['1', '2', '3'],
+          vcf_names=None,
+          names_to_exclude=['4', '5'],
+          min_coverage_fraction=1.0,
+          expected_names=['1', '2', '3']),
+  )
+  def test_ensure_consistent_contigs(self, ref_names, sam_names, vcf_names,
+                                     names_to_exclude, min_coverage_fraction,
+                                     expected_names):
+    ref_contigs = _make_contigs([(name, 100) for name in ref_names])
+    sam_contigs = _make_contigs([(name, 100) for name in sam_names])
+    if vcf_names is not None:
+      vcf_contigs = _make_contigs([(name, 100) for name in vcf_names])
+    else:
+      vcf_contigs = None
+    actual = make_examples._ensure_consistent_contigs(
+        ref_contigs, sam_contigs, vcf_contigs, names_to_exclude,
+        min_coverage_fraction)
+    self.assertEqual([a.name for a in actual], expected_names)
+
+  @parameterized.parameters(
+      dict(
+          ref_names=['1', '2', '3'],
+          sam_names=['1', '2'],
+          vcf_names=None,
+          names_to_exclude=[],
+          min_coverage_fraction=0.67),
+      dict(
+          ref_names=['1', '2', '3'],
+          sam_names=['1', '2'],
+          vcf_names=['1', '3'],
+          names_to_exclude=[],
+          min_coverage_fraction=0.34),
+  )
+  def test_ensure_inconsistent_contigs(self, ref_names, sam_names, vcf_names,
+                                       names_to_exclude, min_coverage_fraction):
+    ref_contigs = _make_contigs([(name, 100) for name in ref_names])
+    sam_contigs = _make_contigs([(name, 100) for name in sam_names])
+    if vcf_names is not None:
+      vcf_contigs = _make_contigs([(name, 100) for name in vcf_names])
+    else:
+      vcf_contigs = None
+    with self.assertRaisesRegexp(ValueError, 'Reference contigs span'):
+      make_examples._ensure_consistent_contigs(ref_contigs, sam_contigs,
+                                               vcf_contigs, names_to_exclude,
+                                               min_coverage_fraction)
+
+  @flagsaver.FlagSaver
+  def test_regions_and_exclude_regions_flags(self):
+    FLAGS.mode = 'calling'
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
+    FLAGS.regions = 'chr20:10,000,000-11,000,000'
+    FLAGS.examples = 'examples.tfrecord'
+    FLAGS.exclude_regions = 'chr20:10,010,000-10,100,000'
+
+    options = make_examples.default_options(add_flags=True)
+    self.assertCountEqual(
+        list(
+            ranges.RangeSet(
+                make_examples.processing_regions_from_options(options))),
+        _from_literals_list(
+            ['chr20:10,000,000-10,009,999', 'chr20:10,100,001-11,000,000']))
+
+  @flagsaver.FlagSaver
+  def test_incorrect_empty_regions(self):
+    FLAGS.mode = 'calling'
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.reads = testdata.CHR20_BAM
+    # Deliberately incorrect contig name.
+    FLAGS.regions = '20:10,000,000-11,000,000'
+    FLAGS.examples = 'examples.tfrecord'
+
+    options = make_examples.default_options(add_flags=True)
+    with self.assertRaisesRegexp(ValueError, 'The regions to call is empty.'):
+      make_examples.processing_regions_from_options(options)
+
 
 class RegionProcessorTest(parameterized.TestCase):
 
@@ -702,9 +962,9 @@ class RegionProcessorTest(parameterized.TestCase):
 
     FLAGS.reads = ''
     self.options = make_examples.default_options(add_flags=False)
-    self.options.reference_filename = test_utils.CHR20_FASTA
-    self.options.reads_filename = test_utils.CHR20_BAM
-    self.options.truth_variants_filename = test_utils.TRUTH_VARIANTS_VCF
+    self.options.reference_filename = testdata.CHR20_FASTA
+    self.options.reads_filename = testdata.CHR20_BAM
+    self.options.truth_variants_filename = testdata.TRUTH_VARIANTS_VCF
     self.options.mode = deepvariant_pb2.DeepVariantOptions.TRAINING
 
     self.processor = make_examples.RegionProcessor(self.options)
@@ -723,16 +983,19 @@ class RegionProcessorTest(parameterized.TestCase):
     return mocked
 
   def test_on_demand_initialization_called_if_not_initialized(self):
+    candidates = ['Candidates']
     self.assertFalse(self.processor.initialized)
     self.processor.in_memory_sam_reader = mock.Mock()
     mock_rr = self.add_mock('region_reads', retval=[])
-    mock_cir = self.add_mock('candidates_in_region', retval=([], []))
+    mock_cir = self.add_mock('candidates_in_region', retval=(candidates, []))
+    mock_lc = self.add_mock('label_candidates', retval=[])
     self.processor.process(self.region)
     test_utils.assert_called_once_workaround(self.mock_init)
     mock_rr.assert_called_once_with(self.region)
     self.processor.in_memory_sam_reader.replace_reads.assert_called_once_with(
         [])
     mock_cir.assert_called_once_with(self.region)
+    mock_lc.assert_called_once_with(candidates, self.region)
 
   def test_on_demand_initialization_not_called_if_initialized(self):
     self.processor.initialized = True
@@ -740,26 +1003,28 @@ class RegionProcessorTest(parameterized.TestCase):
     self.processor.in_memory_sam_reader = mock.Mock()
     mock_rr = self.add_mock('region_reads', retval=[])
     mock_cir = self.add_mock('candidates_in_region', retval=([], []))
+    mock_lc = self.add_mock('label_candidates', retval=[])
     self.processor.process(self.region)
     test_utils.assert_not_called_workaround(self.mock_init)
     mock_rr.assert_called_once_with(self.region)
     self.processor.in_memory_sam_reader.replace_reads.assert_called_once_with(
         [])
     mock_cir.assert_called_once_with(self.region)
+    test_utils.assert_called_once_workaround(mock_lc)
 
   def test_process_calls_no_candidates(self):
     self.processor.in_memory_sam_reader = mock.Mock()
     mock_rr = self.add_mock('region_reads', retval=[])
     mock_cir = self.add_mock('candidates_in_region', retval=([], []))
     mock_cpe = self.add_mock('create_pileup_examples', retval=[])
-    mock_lv = self.add_mock('label_variant')
+    mock_lc = self.add_mock('label_candidates')
     self.assertEqual(([], [], []), self.processor.process(self.region))
     mock_rr.assert_called_once_with(self.region)
     self.processor.in_memory_sam_reader.replace_reads.assert_called_once_with(
         [])
     mock_cir.assert_called_once_with(self.region)
     test_utils.assert_not_called_workaround(mock_cpe)
-    test_utils.assert_not_called_workaround(mock_lv)
+    mock_lc.assert_called_once_with([], self.region)
 
   @parameterized.parameters([
       deepvariant_pb2.DeepVariantOptions.TRAINING,
@@ -772,11 +1037,14 @@ class RegionProcessorTest(parameterized.TestCase):
     mock_read = mock.MagicMock()
     mock_candidate = mock.MagicMock()
     mock_example = mock.MagicMock()
+    mock_label = mock.MagicMock()
     mock_rr = self.add_mock('region_reads', retval=[mock_read])
     mock_cir = self.add_mock(
         'candidates_in_region', retval=([mock_candidate], []))
     mock_cpe = self.add_mock('create_pileup_examples', retval=[mock_example])
-    mock_lv = self.add_mock('label_variant')
+    mock_lc = self.add_mock(
+        'label_candidates', retval=[(mock_candidate, mock_label)])
+    mock_alte = self.add_mock('add_label_to_example', retval=mock_example)
     self.assertEqual(([mock_candidate], [mock_example], []),
                      self.processor.process(self.region))
     mock_rr.assert_called_once_with(self.region)
@@ -785,11 +1053,13 @@ class RegionProcessorTest(parameterized.TestCase):
     mock_cir.assert_called_once_with(self.region)
     mock_cpe.assert_called_once_with(mock_candidate)
 
-    if mode == deepvariant_pb2.DeepVariantOptions.CALLING:
-      # In calling mode, we never try to label.
-      test_utils.assert_not_called_workaround(mock_lv)
+    if mode == deepvariant_pb2.DeepVariantOptions.TRAINING:
+      mock_lc.assert_called_once_with([mock_candidate], self.region)
+      mock_alte.assert_called_once_with(mock_example, mock_label)
     else:
-      mock_lv.assert_called_once_with(mock_example, mock_candidate.variant)
+      # In training mode we don't label our candidates.
+      test_utils.assert_not_called_workaround(mock_lc)
+      test_utils.assert_not_called_workaround(mock_alte)
 
   @parameterized.parameters([
       deepvariant_pb2.DeepVariantOptions.TRAINING,
@@ -800,13 +1070,15 @@ class RegionProcessorTest(parameterized.TestCase):
 
     r1, r2 = mock.Mock(), mock.Mock()
     c1, c2 = mock.Mock(), mock.Mock()
+    l1, l2 = mock.Mock(), mock.Mock()
     e1, e2, e3 = mock.Mock(), mock.Mock(), mock.Mock()
     self.processor.in_memory_sam_reader = mock.Mock()
     self.add_mock('region_reads', retval=[r1, r2])
     self.add_mock('candidates_in_region', retval=([c1, c2], []))
     mock_cpe = self.add_mock(
         'create_pileup_examples', side_effect=[[e1], [e2, e3]])
-    mock_lv = self.add_mock('label_variant')
+    mock_lc = self.add_mock('label_candidates', retval=[(c1, l1), (c2, l2)])
+    mock_alte = self.add_mock('add_label_to_example', side_effect=[e1, e2, e3])
     self.assertEqual(([c1, c2], [e1, e2, e3], []),
                      self.processor.process(self.region))
     self.processor.in_memory_sam_reader.replace_reads.assert_called_once_with(
@@ -816,13 +1088,15 @@ class RegionProcessorTest(parameterized.TestCase):
 
     if mode == deepvariant_pb2.DeepVariantOptions.CALLING:
       # In calling mode, we never try to label.
-      test_utils.assert_not_called_workaround(mock_lv)
+      test_utils.assert_not_called_workaround(mock_lc)
+      test_utils.assert_not_called_workaround(mock_alte)
     else:
+      mock_lc.assert_called_once_with([c1, c2], self.region)
       self.assertEqual([
-          mock.call(e1, c1.variant),
-          mock.call(e2, c2.variant),
-          mock.call(e3, c2.variant)
-      ], mock_lv.call_args_list)
+          mock.call(e1, l1),
+          mock.call(e2, l2),
+          mock.call(e3, l2),
+      ], mock_alte.call_args_list)
 
   def test_process_with_realigner(self):
     self.processor.options.mode = deepvariant_pb2.DeepVariantOptions.CALLING
@@ -840,7 +1114,7 @@ class RegionProcessorTest(parameterized.TestCase):
     self.add_mock('candidates_in_region', retval=([c1, c2], []))
     mock_cpe = self.add_mock(
         'create_pileup_examples', side_effect=[[e1], [e2, e3]])
-    mock_lv = self.add_mock('label_variant')
+    mock_lc = self.add_mock('label_candidates')
 
     self.assertEqual(([c1, c2], [e1, e2, e3], []),
                      self.processor.process(self.region))
@@ -850,7 +1124,7 @@ class RegionProcessorTest(parameterized.TestCase):
     self.processor.in_memory_sam_reader.replace_reads.assert_called_once_with(
         [])
     self.assertEqual([mock.call(c1), mock.call(c2)], mock_cpe.call_args_list)
-    test_utils.assert_not_called_workaround(mock_lv)
+    test_utils.assert_not_called_workaround(mock_lc)
 
   def test_candidates_in_region_no_reads(self):
     self.processor.in_memory_sam_reader = mock.Mock()
@@ -924,7 +1198,7 @@ class RegionProcessorTest(parameterized.TestCase):
 
     self.processor.pic.create_pileup_images.assert_called_once_with(dv_call)
 
-    self.assertEquals(len(actual), 2)
+    self.assertEqual(len(actual), 2)
     for ex, (alt, img) in zip(actual, [(alt1, 'tensor1'), (alt2, 'tensor2')]):
       self.assertEqual(tf_utils.example_alt_alleles(ex), alt)
       self.assertEqual(tf_utils.example_variant(ex), dv_call.variant)
@@ -932,57 +1206,64 @@ class RegionProcessorTest(parameterized.TestCase):
       self.assertEqual(tf_utils.example_image_shape(ex), self.default_shape)
       self.assertEqual(tf_utils.example_image_format(ex), self.default_format)
 
-  def test_label_variant(self):
-    variant = test_utils.make_variant(start=10, alleles=['A', 'C'])
-    tvariant = test_utils.make_variant(start=10, alleles=['A', 'C'], gt=[0, 1])
-    example = tf_utils.make_example(variant, ['C'], 'foo', self.default_shape,
-                                    self.default_format)
-    labeler = mock.Mock()
-    labeler.match = mock.Mock(return_value=[True, tvariant])
-    labeler.match_to_alt_count = mock.Mock(return_value=1)
-    self.processor.labeler = labeler
+  @parameterized.parameters(
+      # Test that a het variant gets a label value of 1 assigned to the example.
+      dict(
+          label=variant_labeler.VariantLabel(
+              is_confident=True,
+              variant=test_utils.make_variant(start=10, alleles=['A', 'C']),
+              genotype=(0, 1)),
+          expected_label_value=1,
+      ),
+      # Test that a reference variant gets a label value of 0 in the example.
+      dict(
+          label=variant_labeler.VariantLabel(
+              is_confident=True,
+              variant=test_utils.make_variant(start=10, alleles=['A', '.']),
+              genotype=(0, 0)),
+          expected_label_value=0,
+      ),
+  )
+  def test_add_label_to_example(self, label, expected_label_value):
+    example = self._example_for_variant(label.variant)
+    labeled = copy.deepcopy(example)
+    actual = self.processor.add_label_to_example(labeled, label)
 
-    labeled = example_pb2.Example()
-    labeled.CopyFrom(example)
-    self.processor.label_variant(labeled, variant)
+    # The add_label_to_example command modifies labeled and returns it.
+    self.assertIs(actual, labeled)
 
-    labeler.match.assert_called_once_with(variant)
-    labeler.match_to_alt_count.assert_called_once_with(variant, tvariant, ['C'])
-
+    # Check that all keys from example are present in labeled.
     for key, value in example.features.feature.iteritems():
-      self.assertEqual(value, labeled.features.feature[key])
-    self.assertEqual(1, tf_utils.example_label(labeled))
-    self.assertEqual(tvariant, tf_utils.example_truth_variant(labeled))
+      if key != 'variant/encoded':  # Special case tested below.
+        self.assertEqual(value, labeled.features.feature[key])
 
-  def test_reference_label_variant(self):
-    variant = test_utils.make_variant(start=10, alleles=['A', '.'])
-    tvariant = test_utils.make_variant(start=10, alleles=['A', '.'], gt=[0, 0])
-    example = tf_utils.make_example(variant, ['.'], 'foo', self.default_shape,
-                                    self.default_format)
+    # The genotype of our example_variant should be set to the true genotype
+    # according to our label.
+    self.assertEqual(expected_label_value, tf_utils.example_label(labeled))
+    labeled_variant = tf_utils.example_variant(labeled)
+    call = variant_utils.only_call(labeled_variant)
+    self.assertEqual(tuple(call.genotype), label.genotype)
 
-    labeler = mock.Mock()
-    labeler.match = mock.Mock(return_value=[True, tvariant])
-    self.processor.labeler = labeler
-
-    labeled = example_pb2.Example()
-    labeled.CopyFrom(example)
-    self.processor.label_variant(labeled, variant)
-
-    labeler.match.assert_called_once_with(variant)
-    labeler.match_to_alt_count.assert_not_called()
-
-    for key, value in example.features.feature.iteritems():
-      self.assertEqual(value, labeled.features.feature[key])
-    self.assertEqual(0, tf_utils.example_label(labeled))
-    self.assertEqual(tvariant, tf_utils.example_truth_variant(labeled))
+    # The original variant and labeled_variant from out tf.Example should be
+    # equal except for the genotype field, since this is set by
+    # add_label_to_example.
+    label.variant.calls[0].genotype[:] = []
+    call.genotype[:] = []
+    self.assertEqual(label.variant, labeled_variant)
 
   def test_label_variant_raises_for_non_confident_variant(self):
-    variant = test_utils.make_variant(start=10, alleles=['A', 'C'], gt=[0, 1])
-    self.processor.labeler = mock.Mock()
-    self.processor.labeler.match = mock.Mock(return_value=[False, variant])
-    example = tf_utils.make_example(variant, ['C'], 'foo', self.default_shape,
-                                    self.default_format)
-    self.assertFalse(self.processor.label_variant(example, variant))
+    label = variant_labeler.VariantLabel(
+        is_confident=False,
+        variant=test_utils.make_variant(start=10, alleles=['A', 'C']),
+        genotype=(0, 1))
+    example = self._example_for_variant(label.variant)
+    with self.assertRaisesRegexp(
+        ValueError, 'Cannot add a non-confident label to an example'):
+      self.processor.add_label_to_example(example, label)
+
+  def _example_for_variant(self, variant):
+    return tf_utils.make_example(variant, list(variant.alternate_bases), 'foo',
+                                 self.default_shape, self.default_format)
 
 
 if __name__ == '__main__':

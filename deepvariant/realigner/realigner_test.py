@@ -37,29 +37,32 @@ import itertools
 import os
 
 
+from absl import flags
 from absl.testing import absltest
 from absl.testing import parameterized
 import tensorflow as tf
 
-from deepvariant import test_utils
-from deepvariant.core import genomics_io
-from deepvariant.core import io_utils
-from deepvariant.core import ranges
-from deepvariant.core.genomics import reads_pb2
-from deepvariant.core.protos import core_pb2
+from third_party.nucleus.io import fasta
+from third_party.nucleus.io import sam
+from third_party.nucleus.protos import reads_pb2
+from third_party.nucleus.testing import test_utils
+from third_party.nucleus.util import io_utils
+from third_party.nucleus.util import ranges
+from deepvariant import testdata
 from deepvariant.protos import realigner_pb2
 from deepvariant.realigner import realigner
 from deepvariant.realigner import utils
+from deepvariant.testing import flagsaver
 
-FLAGS = tf.flags.FLAGS
+FLAGS = flags.FLAGS
 
 
 def setUpModule():
-  test_utils.init()
+  testdata.init()
 
 
 def _get_reads(region):
-  with genomics_io.make_sam_reader(test_utils.CHR20_BAM) as in_sam_reader:
+  with sam.SamReader(testdata.CHR20_BAM) as in_sam_reader:
     return list(in_sam_reader.query(region))
 
 
@@ -182,27 +185,116 @@ class ReadAssignmentTests(parameterized.TestCase):
 class RealignerTest(parameterized.TestCase):
 
   def setUp(self):
-    self.ref_reader = genomics_io.make_ref_reader(test_utils.CHR20_FASTA)
+    self.ref_reader = fasta.RefFastaReader(testdata.CHR20_FASTA)
     self.config = realigner.realigner_config(FLAGS)
     self.reads_realigner = realigner.Realigner(self.config, self.ref_reader)
 
-  @parameterized.parameters((
-      'chr20:10,095,379-10,095,500', 'chr20:10095363-10095543', {
-          'TCCTTTTTGTTGTGCAAAAGGAAGTGCTAAAATCAGAATGAGAACCATGGTCACCTGACATAGACACA'
-          'AGTGATGATGATGATGATGATGATGATGATGATGATGATGATGATGA'
-          'TATCCATGTTCAAGTACTAATTCTGGGCAAGACACTGTTCTAAGTGCTATGAATATATTACCTCAT',
-          'TCCTTTTTGTTGTGCAAAAGGAAGTGCTAAAATCAGAATGAGAACCATGGTCACCTGACATAGACACA'
-          'AGTGATGATGATGATGATGATGATGATGATGATGATGA'
-          'TATCCATGTTCAAGTACTAATTCTGGGCAAGACACTGTTCTAAGTGCTATGAATATATTACCTCAT'
-      }, 'There is a heterozygous 9 bp deletion of tandem TGA repeat.'
-  ), ('chr20:10,046,080-10,046,307', 'chr20:10046107-10046276', {
-      'AGTTAGGGATGCTGGAAAGGCAGAAAGAAAAGGGAAGGGAAGAGGAAGGGGAAAAGGAAAGAAAAAAAAG'
-      'AAAGAAAGAAAGAGAAAGAAAGAGAAAGAGAAAGAAAGAGGAAAGAGAGA'
-      'AAGAGAAAGAGAAGGAAAGAGAAAGAAAGAGAAGGAAAGAGAGAAAGAGA',
-      'AGTTAGGGATGCTGGAAAGGCAGAAAGAAAAGGGAAGGGAAGAGGAAGGGGAAAAGGAAAGAAAAAAAAG'
-      'AAAGAAAGAAAGAGAAAGAGAAAGAAAGAGGAAAGAGAGAAAGAGAAAGA'
-      'GAAGGAAAGAGAAAGAAAGAGAAGGAAAGAGAGAAAGAGA'
-  }, 'There is a heterozygous 10 bp deletion.'))
+  @parameterized.parameters(
+      # Arguments passed by ws_{min,max}_supporting_reads.
+      dict(
+          model=None, min_supporting=2, max_supporting=300, use_ws_model=False),
+      # No flags passed for the window_selection.
+      dict(
+          model=None, min_supporting=-1, max_supporting=-1, use_ws_model=False),
+      # VariantReadsThresholdModel.
+      dict(
+          model='VARIANT_READS_THRESHOLD',
+          min_supporting=-1,
+          max_supporting=-1,
+          use_ws_model=True),
+      # AlleleCountLinearModel.
+      dict(
+          model='ALLELE_COUNT_LINEAR',
+          min_supporting=-1,
+          max_supporting=-1,
+          use_ws_model=True),
+      # Use the default AlleleCountLinearModel.
+      dict(model=None, min_supporting=-1, max_supporting=-1, use_ws_model=True))
+  @flagsaver.FlagSaver
+  def test_window_selector_model_flags(self, model, min_supporting,
+                                       max_supporting, use_ws_model):
+    # This indirection is needed because the symbols in testdata are not set
+    # when the @parameterized decorator is called.
+    symbol_to_testdata = {
+        None: None,
+        'VARIANT_READS_THRESHOLD': testdata.WS_VARIANT_READS_THRESHOLD_MODEL,
+        'ALLELE_COUNT_LINEAR': testdata.WS_ALLELE_COUNT_LINEAR_MODEL
+    }
+    FLAGS.ws_max_num_supporting_reads = max_supporting
+    FLAGS.ws_min_num_supporting_reads = min_supporting
+    FLAGS.ws_window_selector_model = symbol_to_testdata[model]
+    FLAGS.ws_use_window_selector_model = use_ws_model
+    # We only make sure that reading the model does not crash or raise
+    # exceptions.
+    _ = realigner.realigner_config(FLAGS)
+
+  @flagsaver.FlagSaver
+  def test_window_selector_model_flags_failures(self):
+    with self.assertRaisesRegexp(
+        ValueError, 'ws_min_supporting_reads should be smaller than ws_'
+        'max_supporting_reads.'):
+      FLAGS.ws_max_num_supporting_reads = 1
+      FLAGS.ws_min_num_supporting_reads = 2
+      FLAGS.ws_window_selector_model = None
+      FLAGS.ws_use_window_selector_model = False
+      _ = realigner.realigner_config(FLAGS)
+
+    with self.assertRaisesRegexp(
+        ValueError, 'Cannot specify a ws_window_selector_model '
+        'if ws_use_window_selector_model is False.'):
+      FLAGS.ws_max_num_supporting_reads = -1
+      FLAGS.ws_min_num_supporting_reads = -1
+      FLAGS.ws_window_selector_model = testdata.WS_ALLELE_COUNT_LINEAR_MODEL
+      FLAGS.ws_use_window_selector_model = False
+      _ = realigner.realigner_config(FLAGS)
+
+    with self.assertRaisesRegexp(
+        ValueError, 'Cannot use both ws_min_num_supporting_reads and '
+        'ws_use_window_selector_model flags.'):
+      FLAGS.ws_max_num_supporting_reads = -1
+      FLAGS.ws_min_num_supporting_reads = 1
+      FLAGS.ws_window_selector_model = None
+      FLAGS.ws_use_window_selector_model = True
+      _ = realigner.realigner_config(FLAGS)
+
+    with self.assertRaisesRegexp(
+        ValueError, 'Cannot use both ws_max_num_supporting_reads and '
+        'ws_use_window_selector_model flags.'):
+      FLAGS.ws_max_num_supporting_reads = 1
+      FLAGS.ws_min_num_supporting_reads = -1
+      FLAGS.ws_window_selector_model = None
+      FLAGS.ws_use_window_selector_model = True
+      _ = realigner.realigner_config(FLAGS)
+
+  @parameterized.parameters(
+      dict(
+          region_literal='chr20:10,095,379-10,095,500',
+          expected_window_literal='chr20:10,095,353-10,095,553',
+          expected_haplotypes={
+              'AGTGATCTAGTCCTTTTTGTTGTGCAAAAGGAAGTGCTAAAATCAGAATGAGAACCATGGTCAC'
+              'CTGACATAGACACAAGTGATGATGATGATGATGATGATGATGATGATGATGATATCCATGTTCA'
+              'AGTACTAATTCTGGGCAAGACACTGTTCTAAGTGCTATGAATATATTACCTCATTTAATCATC'
+              'T',
+              'AGTGATCTAGTCCTTTTTGTTGTGCAAAAGGAAGTGCTAAAATCAGAATGAGAACCATGGTCAC'
+              'CTGACATAGACACAAGTGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATAT'
+              'CCATGTTCAAGTACTAATTCTGGGCAAGACACTGTTCTAAGTGCTATGAATATATTACCTCATT'
+              'TAATCATCT'
+          },
+          comment='There is a heterozygous 9 bp deletion of tandem TGA repeat.'
+      ),
+      dict(
+          region_literal='chr20:10,046,080-10,046,307',
+          expected_window_literal='chr20:10,046,096-10,046,267',
+          expected_haplotypes={
+              'CCCAAAAAAAGAGTTAGGGATGCTGGAAAGGCAGAAAGAAAAGGGAAGGGAAGAGGAAGGGGAA'
+              'AAGGAAAGAAAAAAAAGAAAGAAAGAAAGAGAAAGAAAGAGAAAGAGAAAGAAAGAGGAAAGAG'
+              'AGAAAGAGAAAGAGAAGGAAAGAGAAAGAAAGAGAAGGAAAGAG',
+              'CCCAAAAAAAGAGTTAGGGATGCTGGAAAGGCAGAAAGAAAAGGGAAGGGAAGAGGAAGGGGAA'
+              'AAGGAAAGAAAAAAAAGAAAGAAAGAAAGAGAAAGAGAAAGAAAGAGGAAAGAGAGAAAGAGAA'
+              'AGAGAAGGAAAGAGAAAGAAAGAGAAGGAAAGAG'
+          },
+          comment='There is a heterozygous 10 bp deletion.'),
+  )
   def test_realigner_example_region(self, region_literal,
                                     expected_window_literal,
                                     expected_haplotypes, comment):
@@ -214,12 +306,15 @@ class RealignerTest(parameterized.TestCase):
     self.assertEqual(len(reads), len(realigned_reads))
     self.assertEqual(
         ranges.parse_literal(expected_window_literal),
-        windows_haplotypes[0].span, comment)
-    self.assertEqual(expected_haplotypes, set(windows_haplotypes[0].haplotypes),
-                     comment)
+        windows_haplotypes[0].span)
+    self.assertEqual(expected_haplotypes, set(windows_haplotypes[0].haplotypes))
 
-  @parameterized.parameters(('chr20:10,046,080-10,046,307',
-                             'chr20:10,046,179-10,046,188'))
+  @parameterized.parameters(
+      [
+          dict(
+              region_literal='chr20:10,046,080-10,046,307',
+              variant_literal='chr20:10,046,179-10,046,188')
+      ],)
   def test_realigner_example_variant(self, region_literal, variant_literal):
     """All overlapping reads should include 10bp deletion at chr20:10046178."""
     region = ranges.parse_literal(region_literal)
@@ -249,24 +344,26 @@ class RealignerTest(parameterized.TestCase):
 
   def test_realigner_doesnt_create_invalid_intervals(self):
     """Tests that read sets don't result in a crash in reference_fai.cc."""
-    read = test_utils.make_read(
-        'ACCGT' * 50,
-        start=63025520 - 250,
-        cigar='250M',
-        quals=range(30, 35) * 50,
-        name='read1')
-    reads = [read] * 20
     region = ranges.parse_literal('chr20:63,025,320-63,025,520')
+
+    reads = [
+        test_utils.make_read(
+            'ACCGT' * 50,
+            start=63025520 - 250,
+            cigar='250M',
+            quals=range(30, 35) * 50) for _ in range(20)
+    ]
     self.reads_realigner.realign_reads(reads, region)
 
-    # These reads are aligned off the edge of the contig.
-    read = test_utils.make_read(
-        'TTATA' * 50,
-        start=63025520 - 200,
-        cigar='200M50S',
-        quals=range(30, 35) * 50,
-        name='read1')
-    reads = [read] * 20
+    # These reads are aligned off the edge of the contig. Note that the
+    # reference bases in this interval are all Ns as well.
+    reads = [
+        test_utils.make_read(
+            'TTATA' * 50,
+            start=63025520 - 200,
+            cigar='200M50S',
+            quals=range(30, 35) * 50) for _ in range(20)
+    ]
     self.reads_realigner.realign_reads(reads, region)
 
   @parameterized.parameters(
@@ -277,9 +374,9 @@ class RealignerTest(parameterized.TestCase):
   def test_realigner_diagnostics(self, enabled, emit_reads):
     # Make sure that by default we aren't emitting any diagnostic outputs.
     dx_dir = test_utils.test_tmpfile('dx')
-    region_str = 'chr20:10046179-10046188'
+    region_str = 'chr20:10046178-10046188'
     region = ranges.parse_literal(region_str)
-    assembled_region_str = 'chr20:10046109-10046257'
+    assembled_region_str = 'chr20:10046099-10046267'
     reads = _get_reads(region)
     self.config = realigner.realigner_config(FLAGS)
     self.config.diagnostics.enabled = enabled
@@ -336,15 +433,17 @@ class RealignerTest(parameterized.TestCase):
 class RealignerIntegrationTest(absltest.TestCase):
 
   def test_realigner_end2end(self):
-    ref_reader = genomics_io.make_ref_reader(test_utils.CHR20_FASTA)
+    ref_reader = fasta.RefFastaReader(testdata.CHR20_FASTA)
     config = realigner.realigner_config(FLAGS)
     reads_realigner = realigner.Realigner(config, ref_reader)
     region_str = 'chr20:10,000,000-10,009,999'
+    windows_count = 0
 
     regions = ranges.RangeSet.from_regions([region_str])
     for region in regions.partition(1000):
-      with genomics_io.make_sam_reader(
-          test_utils.CHR20_BAM, core_pb2.ReadRequirements()) as sam_reader:
+      with sam.SamReader(
+          testdata.CHR20_BAM,
+          read_requirements=reads_pb2.ReadRequirements()) as sam_reader:
         in_reads = list(sam_reader.query(region))
       windows, out_reads = reads_realigner.realign_reads(in_reads, region)
 
@@ -354,14 +453,14 @@ class RealignerIntegrationTest(absltest.TestCase):
       self.assertCountEqual([r.fragment_name for r in in_reads],
                             [r.fragment_name for r in out_reads])
 
-      # Make sure we assembled at least one windows in the region.
-      self.assertNotEqual(0, len(windows))
-
       # Check each window to make sure it's reasonable.
       for window in windows:
         # We always expect the reference sequence to be one of our haplotypes.
-        ref_seq = ref_reader.bases(window.span)
+        ref_seq = ref_reader.query(window.span)
         self.assertIn(ref_seq, set(window.haplotypes))
+      windows_count += len(windows)
+
+    self.assertGreater(windows_count, 0)
 
 
 if __name__ == '__main__':

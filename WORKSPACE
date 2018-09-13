@@ -1,13 +1,25 @@
-workspace(name = "genomics")
+# The workspace name appears at the top of the runfiles tree,
+# and in paths to tests, so to keep python happy it is best
+# if it is unique.
+workspace(name = "com_google_deepvariant")
 
 # Abseil libraries
 git_repository(
-    name = "com_google_absl_py",
-    # redacted
-    commit = "e7e488817ecce91d290d7fcce997b8dda1c6ee77",
+    name = "io_abseil_py",
+    tag = "pypi-v0.2.2",
     remote = "https://github.com/abseil/abseil-py.git",
 )
 # Note: com_google_absl (the C++ abseil library) is provided by TensorFlow.
+
+# CCTZ (Time-zone framework).
+# redacted
+# work in bazel, so we need to include this to enable nucleus's use of
+# //absl/{time,synchronization}
+http_archive(
+    name = "com_googlesource_code_cctz",
+    urls = ["https://github.com/google/cctz/archive/master.zip"],
+    strip_prefix = "cctz-master",
+)
 
 # Note: we are using a post-1.6 build release that fixes a double-free.
 new_http_archive(
@@ -37,13 +49,16 @@ local_repository(
 )
 
 # Required boilerplate for tf_workspace(), apparently.
+# This is copied from https://github.com/tensorflow/tensorflow/blob/master/WORKSPACE
+# Note: This may need to be changed if we change the tensorflow branch that we
+# build against.
 http_archive(
     name = "io_bazel_rules_closure",
-    sha256 = "25f5399f18d8bf9ce435f85c6bbf671ec4820bc4396b3022cc5dc4bc66303609",
-    strip_prefix = "rules_closure-0.4.2",
+    sha256 = "a38539c5b5c358548e75b44141b4ab637bba7c4dc02b46b1f62a96d6433f56ae",
+    strip_prefix = "rules_closure-dbb96841cc0a5fb2664c37822803b06dab20c7d1",
     urls = [
-        "http://mirror.bazel.build/github.com/bazelbuild/rules_closure/archive/0.4.2.tar.gz",  # 2017-08-29
-        "https://github.com/bazelbuild/rules_closure/archive/0.4.2.tar.gz",
+        "https://mirror.bazel.build/github.com/bazelbuild/rules_closure/archive/dbb96841cc0a5fb2664c37822803b06dab20c7d1.tar.gz",
+        "https://github.com/bazelbuild/rules_closure/archive/dbb96841cc0a5fb2664c37822803b06dab20c7d1.tar.gz",  # 2018-04-13
     ],
 )
 

@@ -39,11 +39,12 @@ from absl.testing import parameterized
 import mock
 import tensorflow as tf
 
+from third_party.nucleus.protos import variants_pb2
+from third_party.nucleus.testing import test_utils
+from third_party.nucleus.util import io_utils
+
 from tensorflow.core.example import example_pb2
-from deepvariant import test_utils
 from deepvariant import tf_utils
-from deepvariant.core import io_utils
-from deepvariant.core.genomics import variants_pb2
 
 
 class TFUtilsTest(parameterized.TestCase):
@@ -88,6 +89,31 @@ class TFUtilsTest(parameterized.TestCase):
       # Verifies model_shapes() fails for non-existent tensors.
       with self.assertRaisesRegexp(KeyError, 'v3'):
         tf_utils.model_shapes(save_path, ['v3'])
+
+  def testModelNumClasses(self):
+    # Builds a graph.
+    class_variable_name = 'class_variable_name'
+    v0 = tf.Variable([[1, 2, 3]], dtype=tf.int32, name='class_variable_name')
+    v1 = tf.Variable(
+        [[[1], [2]], [[3], [4]], [[5], [6]]], dtype=tf.float32, name='v1')
+    init_all_op = tf.initialize_all_variables()
+    save = tf.train.Saver({class_variable_name: v0, 'v1': v1})
+    save_path = test_utils.test_tmpfile('ckpt_for_debug_classes')
+    with tf.Session() as sess:
+      sess.run(init_all_op)
+      # Saves a checkpoint.
+      save.save(sess, save_path)
+
+      # If you pass in the correct class_variable_name, you'll find the number
+      # of classes.
+      self.assertEqual(
+          3, tf_utils.model_num_classes(save_path, class_variable_name))
+      # If the class variable name doesn't existin the checkpoint, return None.
+      self.assertEqual(
+          None, tf_utils.model_num_classes(save_path, 'non-existent-var'))
+      # If the checkpoint doesn't exist, return none.
+      self.assertEqual(None,
+                       tf_utils.model_num_classes(None, class_variable_name))
 
   def testMakeExample(self):
     example = tf_utils.make_example(self.variant, self.alts, self.encoded_image,
@@ -143,54 +169,6 @@ class TFUtilsTest(parameterized.TestCase):
       tf_utils.example_set_label(example, label)
       self.assertEqual(label, tf_utils.example_label(example))
 
-  def testExampleSetTruthVariant(self):
-    example = tf_utils.make_example(self.variant, self.alts, self.encoded_image,
-                                    self.default_shape, self.default_format)
-    full_tvariant = variants_pb2.Variant(
-        variant_set_id='variant_set_id',
-        id='id',
-        names=['name1'],
-        created=1234,
-        reference_name='1',
-        start=10,
-        end=11,
-        reference_bases='C',
-        alternate_bases=['A'],
-        filter=['PASS'],
-        quality=1234.5,
-        calls=[
-            variants_pb2.VariantCall(
-                call_set_id='call_set_id',
-                call_set_name='call_set_name',
-                genotype=[0, 1],
-                phaseset='phaseset',
-                genotype_likelihood=[0.1, 0.2, 0.3])
-        ])
-    test_utils.set_list_values(full_tvariant.info['key'], [1])
-    test_utils.set_list_values(full_tvariant.calls[0].info['key'], [2])
-
-    simple_tvariant = variants_pb2.Variant(
-        reference_name='1',
-        start=10,
-        end=11,
-        reference_bases='C',
-        alternate_bases=['A'],
-        filter=['PASS'],
-        quality=1234.5,
-        calls=[
-            variants_pb2.VariantCall(
-                call_set_name='call_set_name', genotype=[0, 1])
-        ])
-    test_utils.set_list_values(simple_tvariant.calls[0].info['key'], [2])
-
-    self.assertIsNotAFeature('truth_variant/encoded', example)
-    tf_utils.example_set_truth_variant(example, full_tvariant, simplify=False)
-    self.assertEqual(full_tvariant, tf_utils.example_truth_variant(example))
-
-    # Check that reencoding with simplify=True produces the simplified version.
-    tf_utils.example_set_truth_variant(example, full_tvariant, simplify=True)
-    self.assertEqual(simple_tvariant, tf_utils.example_truth_variant(example))
-
   def testExampleImageShape(self):
     example = tf_utils.make_example(self.variant, self.alts, self.encoded_image,
                                     self.default_shape, self.default_format)
@@ -238,13 +216,41 @@ class TFUtilsTest(parameterized.TestCase):
         tf_utils.get_shape_from_examples_path(
             test_utils.test_tmpfile(tfrecord_path_to_match)))
 
-  def testGetShapeFromExamplesPathInvalidPath(self):
+  @parameterized.parameters(
+      ('/this/path/does/not/exist', '/this/path/does/not'),
+      ('/bad/pathA/a,/bad/pathB/b', '/bad/pathA'))
+  def testGetShapeFromExamplesPathInvalidPath(self, source_paths,
+                                              expected_partial_message):
     # This calls tf.gfile.Glob, which will raise errors.OpError,
     # at least on a Posix filesystem.  Other filesystems might
     # not fail like that, and will return an empty list, which
     # is turned into a different exception.
-    with self.assertRaisesRegexp(Exception, '/this/path/does/not'):
-      tf_utils.get_shape_from_examples_path('/this/path/does/not/exist')
+    with self.assertRaisesRegexp(Exception, expected_partial_message):
+      tf_utils.get_shape_from_examples_path(source_paths)
+
+  def testStringToIntTensor(self):
+    with tf.Session() as sess:
+      s = '\001\002\003\004\005\006\007'
+      it = tf_utils.string_to_int_tensor(s)
+      x = sess.run(it)
+      a = x[0]
+      self.assertEqual(a, len(s))
+      b = list(x[1:a + 1])
+      self.assertEqual(b, [1, 2, 3, 4, 5, 6, 7])
+
+  def testIntTensorToString(self):
+    with tf.Session() as sess:
+      s = '\001\002\003\004\005\006\007'
+      it = tf_utils.string_to_int_tensor(s)
+      x = sess.run(it)
+      t = tf_utils.int_tensor_to_string(x)
+      self.assertEqual(t, s)
+
+  def testCompressionTypeOfFiles(self):
+    self.assertEqual(
+        'GZIP', tf_utils.compression_type_of_files(['/tmp/foo.tfrecord.gz']))
+    self.assertEqual(None,
+                     tf_utils.compression_type_of_files(['/tmp/foo.tfrecord']))
 
 
 if __name__ == '__main__':

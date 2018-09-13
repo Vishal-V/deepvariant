@@ -34,6 +34,12 @@ set -eux -o pipefail
 
 source settings.sh
 
+# bazel should have been installed in build-prereq.sh, but the PATH might
+# need to be added in this script.
+if ! bazel; then
+  PATH="$HOME/bin:$PATH"
+fi
+
 # Run all deepvariant tests.  Take bazel options from args, if any.
 # Note: If running with GPU, tests must be executed serially due to a GPU
 # contention issue.
@@ -48,8 +54,14 @@ else
   bazel test -c opt ${DV_COPT_FLAGS} "$@" deepvariant/...
 fi
 
-# Create some build artifacts.
+# Create some build artifacts (two ways), and execute one of them.
 bazel build -c opt ${DV_COPT_FLAGS} "$@" deepvariant:binaries
+echo 'Expect a usage message:'
+(bazel-bin/deepvariant/call_variants --help || : ) | grep '/call_variants.py:'
+
+bazel build -c opt ${DV_COPT_FLAGS} "$@" deepvariant:binaries --build_python_zip
+echo 'Expect a usage message:'
+(bazel-bin/deepvariant/call_variants --help || : ) | grep '/call_variants.py:'
 
 # Bundle the licenses.
 bazel build :licenses_zip

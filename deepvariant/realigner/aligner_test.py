@@ -36,10 +36,11 @@ from __future__ import print_function
 from absl.testing import absltest
 from absl.testing import parameterized
 
-from deepvariant import test_utils
-from deepvariant.core import cigar as _cigar
-from deepvariant.core import ranges
-from deepvariant.core.genomics import cigar_pb2
+from third_party.nucleus.protos import cigar_pb2
+from third_party.nucleus.testing import test_utils
+from third_party.nucleus.util import cigar as _cigar
+
+from third_party.nucleus.util import ranges
 from deepvariant.protos import realigner_pb2
 from deepvariant.realigner import aligner
 
@@ -213,7 +214,7 @@ class PairwiseAlignerTest(parameterized.TestCase):
 class AlignerTest(parameterized.TestCase):
 
   def make_test_aligner(self, ref_seq=None, region=None):
-    config = realigner_pb2.RealignerOptions.AlignerOptions(
+    config = realigner_pb2.AlignerOptions(
         match=1, mismatch=1, gap_open=2, gap_extend=1, k=3, error_rate=.02)
     ref_seq = ref_seq or 'AAAAAAA'
     region = region or ranges.make_range('ref', 10, 10 + len(ref_seq))

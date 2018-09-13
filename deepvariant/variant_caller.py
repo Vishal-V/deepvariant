@@ -37,16 +37,18 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import itertools
-import math as py_math
+import math
 import operator
 
 
 import numpy as np
 
-from deepvariant.core import math
-from deepvariant.core import variantutils
-from deepvariant.core.genomics import variants_pb2
+from third_party.nucleus.protos import variants_pb2
+from third_party.nucleus.util import genomics_math
+from third_party.nucleus.util import variantcall_utils
+from third_party.nucleus.util import vcf_constants
 from deepvariant.python import variant_calling
 
 # Reference bases with genotype calls must be one of these four values.
@@ -54,6 +56,11 @@ CANONICAL_DNA_BASES = frozenset('ACGT')
 
 # Possible DNA base codes seen in a reference genome.
 EXTENDED_IUPAC_CODES = frozenset('ACGTRYSWKMBDHVN')
+
+# Data collection class used in creation of gVCF records.
+_GVCF = collections.namedtuple(
+    '_GVCF',
+    ['summary_counts', 'quantized_gq', 'raw_gq', 'likelihoods', 'read_depth'])
 
 
 def _rescale_read_counts_if_necessary(n_ref_reads, n_total_reads,
@@ -78,9 +85,26 @@ def _rescale_read_counts_if_necessary(n_ref_reads, n_total_reads,
   """
   if n_total_reads > max_allowed_reads:
     ratio = n_ref_reads / (1.0 * n_total_reads)
-    n_ref_reads = int(py_math.ceil(ratio * max_allowed_reads))
+    n_ref_reads = int(math.ceil(ratio * max_allowed_reads))
     n_total_reads = max_allowed_reads
   return n_ref_reads, n_total_reads
+
+
+def _quantize_gq(raw_gq, binsize):
+  """Returns a quantized value of GQ in units of binsize.
+
+  Args:
+    raw_gq: int. The raw GQ value to quantize.
+    binsize: positive int. The size of bins to quantize within.
+
+  Returns:
+    A quantized GQ integer.
+  """
+  if raw_gq < 1:
+    return 0
+  else:
+    bin_number = (raw_gq - 1) // binsize
+    return bin_number * binsize + 1
 
 
 class VariantCaller(object):
@@ -174,18 +198,19 @@ class VariantCaller(object):
 
     if n_total == 0:
       # No coverage case - all likelihoods are log10 of 1/3, 1/3, 1/3.
-      log10_probs = math.normalize_log10_probs([-1.0, -1.0, -1.0])
+      log10_probs = genomics_math.normalize_log10_probs([-1.0, -1.0, -1.0])
     else:
       n_alts = n_total - n_ref
-      log10_p_ref = math.log10_binomial(n_alts, n_total, self.options.p_error)
-      log10_p_het = math.log10_binomial(n_ref, n_total,
-                                        1.0 / self.options.ploidy)
-      log10_p_hom_alt = math.log10_binomial(n_ref, n_total,
-                                            self.options.p_error)
-      log10_probs = math.normalize_log10_probs(
+      log10_p_ref = genomics_math.log10_binomial(n_alts, n_total,
+                                                 self.options.p_error)
+      log10_p_het = genomics_math.log10_binomial(n_ref, n_total,
+                                                 1.0 / self.options.ploidy)
+      log10_p_hom_alt = genomics_math.log10_binomial(n_ref, n_total,
+                                                     self.options.p_error)
+      log10_probs = genomics_math.normalize_log10_probs(
           [log10_p_ref, log10_p_het, log10_p_hom_alt])
 
-    gq = math.log10_ptrue_to_phred(log10_probs[0], self.options.max_gq)
+    gq = genomics_math.log10_ptrue_to_phred(log10_probs[0], self.options.max_gq)
     gq = int(min(np.floor(gq), self.options.max_gq))
     return gq, log10_probs
 
@@ -197,8 +222,9 @@ class VariantCaller(object):
     blocks for all sites in allele_count_summaries. The returned Variant has
     reference_name, start, end are set and contains a single VariantCall in the
     calls field with call_set_name of options.sample_name, genotypes set to 0/0
-    (diploid reference), and a GQ value bound in the info field appropriate to
-    the data in allele_count.
+    (diploid reference), a GQ value bound in the info field appropriate to the
+    data in allele_count, and a MIN_DP value which is the minimum read coverage
+    seen in the block.
 
     The provided allele count must have either a canonical DNA sequence base (
     A, C, G, T) or be "N".
@@ -210,7 +236,7 @@ class VariantCaller(object):
         base.
 
     Yields:
-      learning.genomics.deepvariant.core.genomics.Variant proto in
+      third_party.nucleus.protos.Variant proto in
       coordinate-sorted order containing gVCF records.
     """
 
@@ -224,9 +250,9 @@ class VariantCaller(object):
         summary_counts: A single AlleleCountSummary.
 
       Returns:
-        A tuple of summary_counts, GQ, and genotype likelihoods for
-        summary_counts where GQ and genotype_likelihood are calculated by
-        self.reference_confidence.
+        A tuple of summary_counts, quantized GQ, raw GQ, and genotype
+        likelihoods for summary_counts where raw GQ and genotype_likelihood are
+        calculated by self.reference_confidence.
 
       Raises:
         ValueError: The reference base is not a valid DNA or IUPAC base.
@@ -235,15 +261,22 @@ class VariantCaller(object):
         if summary_counts.ref_base in EXTENDED_IUPAC_CODES:
           # Skip calculating gq and likelihoods, since this is an ambiguous
           # reference base.
-          gq, likelihoods = None, None
+          quantized_gq, raw_gq, likelihoods = None, None, None
+          n_total = summary_counts.total_read_count
         else:
           raise ValueError('Invalid reference base={} found during gvcf '
                            'calculation'.format(summary_counts.ref_base))
       else:
         n_ref = summary_counts.ref_supporting_read_count
         n_total = summary_counts.total_read_count
-        gq, likelihoods = self.reference_confidence(n_ref, n_total)
-      return summary_counts, gq, likelihoods
+        raw_gq, likelihoods = self.reference_confidence(n_ref, n_total)
+        quantized_gq = _quantize_gq(raw_gq, self.options.gq_resolution)
+      return _GVCF(
+          summary_counts=summary_counts,
+          quantized_gq=quantized_gq,
+          raw_gq=raw_gq,
+          likelihoods=likelihoods,
+          read_depth=n_total)
 
     # Combines contiguous, compatible single-bp blocks into larger gVCF blocks,
     # respecting non-reference variants interspersed among them. Yields each
@@ -251,24 +284,27 @@ class VariantCaller(object):
     # blocks to be merged have the same non-None GQ value.
     for key, combinable in itertools.groupby(
         (with_gq_and_likelihoods(sc) for sc in allele_count_summaries),
-        key=operator.itemgetter(1)):
+        key=operator.attrgetter('quantized_gq')):
       if key is None:
         # A None key indicates that a non-DNA reference base was encountered, so
         # skip this group.
         continue
       combinable = list(combinable)
-      summary_counts, gq, likelihoods = combinable[0]
+      min_gq = min(elt.raw_gq for elt in combinable)
+      min_dp = min(elt.read_depth for elt in combinable)
+      first_record, last_record = combinable[0], combinable[-1]
       call = variants_pb2.VariantCall(
           call_set_name=self.options.sample_name,
           genotype=[0, 0],
-          genotype_likelihood=likelihoods)
-      variantutils.set_variantcall_gq(call, gq)
+          genotype_likelihood=first_record.likelihoods)
+      variantcall_utils.set_gq(call, min_gq)
+      variantcall_utils.set_min_dp(call, min_dp)
       yield variants_pb2.Variant(
-          reference_name=summary_counts.reference_name,
-          reference_bases=summary_counts.ref_base,
-          alternate_bases=[variantutils.GVCF_ALT_ALLELE],
-          start=summary_counts.position,
-          end=combinable[-1][0].position + 1,
+          reference_name=first_record.summary_counts.reference_name,
+          reference_bases=first_record.summary_counts.ref_base,
+          alternate_bases=[vcf_constants.GVCF_ALT_ALLELE],
+          start=first_record.summary_counts.position,
+          end=last_record.summary_counts.position + 1,
           calls=[call])
 
   def calls_from_allele_counter(self, allele_counter, include_gvcfs):

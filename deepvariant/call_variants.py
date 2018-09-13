@@ -32,24 +32,25 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import time
 
 
 
+from absl import flags
+from absl import logging
 import numpy as np
 import tensorflow as tf
 
-from absl import logging
-
+from third_party.nucleus.protos import variants_pb2
+from third_party.nucleus.util import errors
+from third_party.nucleus.util import io_utils
+from third_party.nucleus.util import proto_utils
+from third_party.nucleus.util import variant_utils
+from deepvariant import data_providers
 from deepvariant import logging_level
 from deepvariant import modeling
 from deepvariant import tf_utils
-from deepvariant.core import errors
-from deepvariant.core import htslib_gcp_oauth
-from deepvariant.core import io_utils
-from deepvariant.core import proto_utils
-from deepvariant.core import variantutils
-from deepvariant.core.genomics import variants_pb2
 from deepvariant.protos import deepvariant_pb2
 
 _ALLOW_EXECUTION_HARDWARE = [
@@ -62,121 +63,115 @@ _ALLOW_EXECUTION_HARDWARE = [
 # rounded to, for numerical stability.
 _GL_PRECISION = 10
 
-FLAGS = tf.flags.FLAGS
+FLAGS = flags.FLAGS
 
-tf.flags.DEFINE_string(
+flags.DEFINE_string(
     'examples', None,
     'Required. tf.Example protos containing DeepVariant candidate variants in '
     'TFRecord format, as emitted by make_examples.')
-tf.flags.DEFINE_string(
+flags.DEFINE_string(
     'outfile', None,
     'Required. Destination path where we will write output candidate variants '
     'with additional likelihood information in TFRecord format of '
     'CallVariantsOutput protos.')
-tf.flags.DEFINE_string(
+flags.DEFINE_string(
     'checkpoint', None,
     'Required. Path to the TensorFlow model checkpoint to use to evaluate '
     'candidate variant calls.')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer(
     'batch_size', 512,
     'Number of candidate variant tensors to batch together during inference. '
     'Larger batches use more memory but are more computational efficient.')
-tf.flags.DEFINE_integer('max_batches', None,
-                        'Max. batches to evaluate. Defaults to all.')
-tf.flags.DEFINE_integer('num_readers', 8,
-                        'Number of parallel readers to create for examples.')
-tf.flags.DEFINE_string('model_name', 'inception_v3',
-                       'The name of the model architecture of --checkpoint.')
-tf.flags.DEFINE_boolean('include_debug_info', False,
-                        'If true, include extra debug info in the output.')
-tf.flags.DEFINE_string(
+flags.DEFINE_integer('max_batches', None,
+                     'Max. batches to evaluate. Defaults to all.')
+flags.DEFINE_integer('num_readers', 8,
+                     'Number of parallel readers to create for examples.')
+flags.DEFINE_string('model_name', 'inception_v3',
+                    'The name of the model architecture of --checkpoint.')
+flags.DEFINE_boolean('include_debug_info', False,
+                     'If true, include extra debug info in the output.')
+flags.DEFINE_boolean(
+    'debugging_true_label_mode', False,
+    'If true, read the true labels from examples and add to '
+    'output. Note that the program will crash if the input '
+    'examples do not have the label field. '
+    'When true, this will also fill everything when '
+    '--include_debug_info is set to true.')
+flags.DEFINE_string(
     'execution_hardware', 'auto',
     'When in cpu mode, call_variants will not place any ops on the GPU, even '
     'if one is available. In accelerator mode call_variants validates that at '
     'least some hardware accelerator (GPU/TPU) was available for us. This '
     'option is primarily for QA purposes to allow users to validate their '
     'accelerator environment is correctly configured. In auto mode, the '
-    'default, op placement is entirely left up to TensorFlow')
+    'default, op placement is entirely left up to TensorFlow.  In tpu mode, '
+    'use and require TPU.')
+
+# Cloud TPU Cluster Resolvers
+flags.DEFINE_string(
+    'gcp_project', None,
+    'Project name for the Cloud TPU-enabled project. If not specified, we '
+    'will attempt to automatically detect the GCE project from metadata.')
+flags.DEFINE_string(
+    'tpu_zone', None,
+    'GCE zone where the Cloud TPU is located in. If not specified, we '
+    'will attempt to automatically detect the GCE project from metadata.')
+flags.DEFINE_string(
+    'tpu_name', None,
+    'Name of the Cloud TPU for Cluster Resolvers. You must specify either '
+    'this flag or --master.')
+
+flags.DEFINE_string(
+    'master', None,
+    'GRPC URL of the master (e.g. grpc://ip.address.of.tpu:8470). You '
+    'must specify either this flag or --tpu_name.')
+
+flags.DEFINE_boolean('use_tpu', False, 'Use tpu if available.')
+
+flags.DEFINE_string(
+    'kmp_blocktime', '0',
+    'Value to set the KMP_BLOCKTIME environment variable to for efficient MKL '
+    'inference. See https://www.tensorflow.org/performance/performance_guide '
+    'for more information. The default value is 0, which provides the best '
+    'performance in our tests. Set this flag to "" to not set the variable.')
 
 
 class ExecutionHardwareError(Exception):
   pass
 
 
-def prepare_inputs(source_path, model, batch_size, num_readers=None):
-  """Prepares image and encoded_variant ops.
-
-  Reads image / encoded_variant tuples from source_path, extracting the image
-  and encoded_variant tensors from source_path. The image is decoded from its
-  png encoding and preprocessed with model.preprocess_image as well. Every
-  example in source_path is read once (num_epoch=1).
+def prepare_inputs(source_path, use_tpu=False, num_readers=None):
+  """Return a tf.data input_fn from the source_path.
 
   Args:
     source_path: Path to a TFRecord file containing deepvariant tf.Example
       protos.
-    model: A DeepVariantModel whose preprocess_image function will be used on
-      image.
-    batch_size: int > 0. Size of batches to use during inference.
+    use_tpu: boolean.  Use the tpu code path.
     num_readers: int > 0 or None. Number of parallel readers to use to read
       examples from source_path. If None, uses FLAGS.num_readers instead.
 
   Returns:
-    A tuple of (image, encoded_variant, encoded_alt_allele_indices) TF ops.
-    Image is a [height, width, channel] tensor.
-    encoded_variants is a tf.string tensor containing a serialized Variant proto
-    describing the variant call associated with image.
-    encoded_alt_allele_indices is a tf.string tensor containing a serialized
-    CallVariantsOutput.AltAlleleIndices proto containing the
-    alternate alleles indices used as "alt" when constructing the image.
+    A tf input_fn yielding batches of image, encoded_variant,
+    encoded_alt_allele_indices.
+
+    The image is a [batch_size, height, width, channel] tensor. The
+    encoded_variants is a tf.string or tpu-encoded tensor containing a
+    serialized Variant proto describing the variant call associated with
+    image. The encoded_alt_allele_indices is a tf.string or tpu-encoded
+    tensor containing a serialized CallVariantsOutput.AltAlleleIndices proto
+    containing the alternate alleles indices used as "alt" when constructing
+    the image.
   """
   if not num_readers:
     num_readers = FLAGS.num_readers
 
-  tensor_shape = tf_utils.get_shape_from_examples_path(source_path)
-
-  def _parse_single_example(serialized_example):
-    """Parses serialized example into a dictionary of de-serialized features."""
-    features = tf.parse_single_example(
-        serialized_example,
-        features={
-            'image/encoded': tf.FixedLenFeature([], tf.string),
-            'variant/encoded': tf.FixedLenFeature([], tf.string),
-            # deepvariant_pb2.CallVariantsOutput.AltAlleleIndices
-            'alt_allele_indices/encoded': tf.FixedLenFeature([], tf.string),
-        })
-    return features
-
-  with tf.name_scope('input'):
-
-    def _preprocess_image(features):
-      """Preprocess images (decode, reshape, and apply model-specific steps)."""
-      image = features['image/encoded']
-      # Bypassing the reshaping and preprocessing if there is no tensor_shape.
-      # Currently that could happen when the input file is empty.
-      if tensor_shape:
-        image = tf.reshape(tf.decode_raw(image, tf.uint8), tensor_shape)
-        image = model.preprocess_image(image)
-      features['image/encoded'] = image
-      return features
-
-    files = tf.gfile.Glob(io_utils.NormalizeToShardedFilePattern(source_path))
-    reader_options = io_utils.make_tfrecord_options(files)
-    if reader_options.compression_type == (
-        tf.python_io.TFRecordCompressionType.GZIP):
-      compression_type = 'GZIP'
-    else:
-      compression_type = None
-    dataset = tf.data.TFRecordDataset(files, compression_type=compression_type)
-    dataset = dataset.map(
-        _parse_single_example, num_parallel_calls=FLAGS.num_readers)
-    dataset = dataset.map(
-        _preprocess_image, num_parallel_calls=FLAGS.num_readers)
-    dataset = dataset.prefetch(10 * batch_size)
-    dataset = dataset.batch(batch_size)
-    iterator = dataset.make_one_shot_iterator()
-    features = iterator.get_next()
-    return (features['image/encoded'], features['variant/encoded'],
-            features['alt_allele_indices/encoded'])
+  return data_providers.get_input_fn_from_filespec(
+      input_file_spec=source_path,
+      mode=tf.estimator.ModeKeys.PREDICT,
+      use_tpu=use_tpu,
+      input_read_threads=num_readers,
+      debugging_true_label_mode=FLAGS.debugging_true_label_mode,
+  )
 
 
 def round_gls(gls, precision=None):
@@ -215,96 +210,62 @@ def round_gls(gls, precision=None):
   return rounded_gls
 
 
-def call_batch(sess, writer, encoded_variants, encoded_alt_allele_indices,
-               predictions):
-  """Calls variants by computing the genotype likelihoods predictions.
-
-  This function runs TF to get the values for the predictions for each
-  encoded_variants. The resulting genotype likelihoods incorporated into the
-  decoded versions of encoded_variants, populating the QUAL, genotype, PL, and
-  GQ fields.
-
-  NOTE: This function isn't yet fully operational or complete. We don't
-  actually update Variant, we don't handle multi-allelic variants, etc. The
-  API will need to change as we incorporate these improvements.
+def write_variant_call(writer, prediction, use_tpu):
+  """Write the variant call based on prediction.
 
   Args:
-    sess: A TensorFlow session where we can evaluate encoded_variants and
-      predictions.
     writer: A object with a write() function that will be called for each
       encoded_variant and genotype likelihoods.
-    encoded_variants: A [batch_size, 1] tensor of strings. Each string should be
-      a learning.genomics.deepvariant.core.genomics.Variant encoded protobuf.
-    encoded_alt_allele_indices: a tf.string tensor containing a serialized
-      CallVariantsOutput.AltAlleleIndices proto containing the
-      alternate alleles indices used as "alt" when constructing the image.
-    predictions: A [batch_size, 3] tensor of floats. These are the predicted
+    prediction: A [3] tensor of floats. These are the predicted
       genotype likelihoods (p00, p0x, pxx) for some alt allele x, in the same
       order as encoded_variants.
+      use_tpu: bool.  Decode the tpu specific encoding of prediction.
 
   Returns:
-    The number of variants called and written out.
+    The return status from writer.
   """
-  # After we run the input encoded_variants and predictions they are now
-  # concrete objects, not promises, so we can start worthing their values.
-  encoded_variants, encoded_alt_allele_indices, predictions = sess.run(
-      [encoded_variants, encoded_alt_allele_indices, predictions])
+  encoded_variant = prediction['variant']
+  if use_tpu:
+    encoded_variant = tf_utils.int_tensor_to_string(encoded_variant)
 
-  # Walk over the variants / prediction pairs, creating our calls.
-  for encoded_variant, one_encoded_alt_allele_indices, gls in zip(
-      encoded_variants, encoded_alt_allele_indices, predictions):
-    # Round the genotype probabilities to a stable precision level.
-    rounded_gls = round_gls(gls, precision=_GL_PRECISION)
-    writer.write(encoded_variant, rounded_gls, one_encoded_alt_allele_indices)
+  encoded_alt_allele_indices = prediction['alt_allele_indices']
+  if use_tpu:
+    encoded_alt_allele_indices = tf_utils.int_tensor_to_string(
+        encoded_alt_allele_indices)
 
-  return len(encoded_variants)
+  rounded_gls = round_gls(prediction['probabilities'], precision=_GL_PRECISION)
+
+  # Write it out.
+  true_labels = prediction['label'] if FLAGS.debugging_true_label_mode else None
+  cvo = _create_cvo_proto(encoded_variant, rounded_gls,
+                          encoded_alt_allele_indices, true_labels)
+  return writer.write(cvo.SerializeToString())
 
 
-def make_async_writer(write_fn):
-  """Creates an AsyncWriter writing CallVariantsOutput to write_fn.
-
-  The output CallVariantsOutput proto contains fields that are used to
-  sort and merge multi-allelic after the call_variants step. It contains the
-  serialized Variant proto in the 'variant/encoded' field.
-
-  The created AsyncWriter has a write() function accepting 3 arguments,
-  a CallVariantsOutput (which contains the serialized
-  learning.genomics.v1.Variant proto), a vector of genotype_probabilities,
-  and the alt_allele_indices that describes the biallelics used in the
-  computation by our deep learning model, one for each genotype state
-  of variant.  This write method invokes add_call_to_variant, on the
-  decoded variant to add the call information, and then calls write_fn
-  on this variant.
-
-  Args:
-    write_fn: A function accepting a CallVariantsOutput proto that
-    writes to its underlying writer.
-
-  Returns:
-    An AsyncWriter.
-  """
-
-  def write_output(encoded_variant, gls, encoded_alt_allele_indices):
-    """Provides a write function for a CallVariantsOutput proto."""
-    variant = variants_pb2.Variant.FromString(encoded_variant)
-    alt_allele_indices = (
-        deepvariant_pb2.CallVariantsOutput.AltAlleleIndices.FromString(
-            encoded_alt_allele_indices))
-    debug_info = None
-    if FLAGS.include_debug_info:
-      debug_info = deepvariant_pb2.CallVariantsOutput.DebugInfo(
-          has_insertion=variantutils.has_insertion(variant),
-          has_deletion=variantutils.has_deletion(variant),
-          is_snp=variantutils.is_snp(variant),
-          predicted_label=np.argmax(gls))
-    call_variants_output = deepvariant_pb2.CallVariantsOutput(
-        variant=variant,
-        alt_allele_indices=alt_allele_indices,
-        genotype_probabilities=gls,
-        debug_info=debug_info)
-    write_fn(call_variants_output)
-
-  return io_utils.AsyncWriter(write_output)
+def _create_cvo_proto(encoded_variant,
+                      gls,
+                      encoded_alt_allele_indices,
+                      true_labels=None):
+  """Returns a CallVariantsOutput proto from the relevant input information."""
+  variant = variants_pb2.Variant.FromString(encoded_variant)
+  alt_allele_indices = (
+      deepvariant_pb2.CallVariantsOutput.AltAlleleIndices.FromString(
+          encoded_alt_allele_indices))
+  debug_info = None
+  if FLAGS.include_debug_info or FLAGS.debugging_true_label_mode:
+    debug_info = deepvariant_pb2.CallVariantsOutput.DebugInfo(
+        has_insertion=variant_utils.has_insertion(variant),
+        has_deletion=variant_utils.has_deletion(variant),
+        is_snp=variant_utils.is_snp(variant),
+        predicted_label=np.argmax(gls),
+        true_label=true_labels,
+    )
+  call_variants_output = deepvariant_pb2.CallVariantsOutput(
+      variant=variant,
+      alt_allele_indices=alt_allele_indices,
+      genotype_probabilities=gls,
+      debug_info=debug_info)
+  return call_variants_output
 
 
 def call_variants(examples_filename,
@@ -313,66 +274,91 @@ def call_variants(examples_filename,
                   output_file,
                   execution_hardware='auto',
                   batch_size=16,
-                  max_batches=None):
+                  max_batches=None,
+                  use_tpu=False,
+                  master=''):
   """Main driver of call_variants."""
+  if FLAGS.kmp_blocktime:
+    os.environ['KMP_BLOCKTIME'] = FLAGS.kmp_blocktime
+    logging.info('Set KMP_BLOCKTIME to %s', os.environ['KMP_BLOCKTIME'])
+
   # Read a single TFExample to make sure we're not loading an older version.
   example_format = tf_utils.get_format_from_examples_path(examples_filename)
-  if example_format != 'raw':
+  if example_format is None:
+    logging.warning('Unable to read any records from %s. Output will contain '
+                    'zero records.', examples_filename)
+    io_utils.write_tfrecords([], output_file)
+    return
+  elif example_format != 'raw':
     raise ValueError('The TF examples in {} has image/format \'{}\' '
                      '(expected \'raw\') which means you might need to rerun '
-                     'make_examples to genenerate the examples again.'.format(
+                     'make_examples to generate the examples again.'.format(
                          examples_filename, example_format))
 
+  # Check accelerator status.
   if execution_hardware not in _ALLOW_EXECUTION_HARDWARE:
     raise ValueError(
         'Unexpected execution_hardware={} value. Allowed values are {}'.format(
             execution_hardware, ','.join(_ALLOW_EXECUTION_HARDWARE)))
+  init_op = tf.group(tf.global_variables_initializer(),
+                     tf.local_variables_initializer())
+  device_count = {'GPU': 0, 'TPU': 0} if execution_hardware == 'cpu' else {}
+  config = tf.ConfigProto(device_count=device_count)
+  with tf.Session(config=config) as sess:
+    sess.run(init_op)
+    if execution_hardware == 'accelerator':
+      if not any(dev.device_type != 'CPU' for dev in sess.list_devices()):
+        raise ExecutionHardwareError(
+            'execution_hardware is set to accelerator, but no accelerator '
+            'was found')
+    # redacted
+    # sess.list_devices here doesn't return the correct answer. That can only
+    # work later, after the device (on the other VM) has been initialized,
+    # which is generally not yet.
 
-  with tf.Graph().as_default():
-    images, encoded_variants, encoded_alt_allele_indices = prepare_inputs(
-        examples_filename, model, batch_size, FLAGS.num_readers)
+  # Prepare input stream and estimator.
+  tf_dataset = prepare_inputs(source_path=examples_filename, use_tpu=use_tpu)
+  estimator = model.make_estimator(
+      batch_size=batch_size,
+      master=master,
+      use_tpu=use_tpu,
+  )
 
-    # Create our model and extract the predictions from the model endpoints.
-    predictions = model.create(images, 3, is_training=False)['Predictions']
+  # Instantiate the prediction "stream", and select the EMA values from
+  # the model.
+  if checkpoint_path is None:
+    # Unit tests use this branch.
+    predict_hooks = []
+  else:
+    predict_hooks = [h(checkpoint_path) for h in model.session_predict_hooks()]
+  predictions = iter(
+      estimator.predict(
+          input_fn=tf_dataset,
+          checkpoint_path=checkpoint_path,
+          hooks=predict_hooks))
 
-    # The op for initializing the variables.
-    init_op = tf.group(tf.global_variables_initializer(),
-                       tf.local_variables_initializer())
+  # Consume predictions one at a time and write them to output_file.
+  logging.info('Writing calls to %s', output_file)
+  writer, _ = io_utils.make_proto_writer(output_file)
+  with writer:
+    start_time = time.time()
+    n_examples, n_batches = 0, 0
+    while max_batches is None or n_batches <= max_batches:
+      try:
+        prediction = next(predictions)
+      except (StopIteration, tf.errors.OutOfRangeError):
+        break
+      write_variant_call(writer, prediction, use_tpu)
+      n_examples += 1
+      n_batches = n_examples // batch_size + 1
+      duration = time.time() - start_time
 
-    device_count = {'GPU': 0, 'TPU': 0} if execution_hardware == 'cpu' else {}
-    config = tf.ConfigProto(device_count=device_count)
-    with tf.Session(config=config) as sess:
-      sess.run(init_op)
+      logging.log_every_n(
+          logging.INFO,
+          ('Processed %s examples in %s batches [%.3f sec per 100]'),
+          batch_size, n_examples, n_batches, (100 * duration) / n_examples)
 
-      # Initial the model from the provided checkpoint using our session.
-      logging.info('Initializing model from %s', checkpoint_path)
-      model.initialize_from_checkpoint(checkpoint_path, 3, False)(sess)
-
-      if execution_hardware == 'accelerator':
-        if not any(dev.device_type != 'CPU' for dev in sess.list_devices()):
-          raise ExecutionHardwareError(
-              'execution_hardware is set to accelerator, but no accelerator '
-              'was found')
-
-      logging.info('Writing calls to %s', output_file)
-      sync_writer, write_fn = io_utils.make_proto_writer(output_file)
-      with sync_writer, make_async_writer(write_fn) as writer:
-        start_time = time.time()
-        try:
-          n_batches = 0
-          n_examples = 0
-          while max_batches is None or n_batches < max_batches:
-            n_called = call_batch(sess, writer, encoded_variants,
-                                  encoded_alt_allele_indices, predictions)
-
-            duration = time.time() - start_time
-            n_batches += 1
-            n_examples += n_called
-            logging.info(
-                ('Processed %s examples in %s batches [%.2f sec per 100]'),
-                n_examples, n_batches, (100 * duration) / n_examples)
-        except tf.errors.OutOfRangeError:
-          logging.info('Done evaluating variants')
+    logging.info('Done evaluating variants')
 
 
 def main(argv=()):
@@ -387,8 +373,8 @@ def main(argv=()):
 
     logging_level.set_from_flag()
 
-    # Give htslib authentication access to GCS.
-    htslib_gcp_oauth.init()
+    master = tf_utils.resolve_master(FLAGS.master, FLAGS.tpu_name,
+                                     FLAGS.tpu_zone, FLAGS.gcp_project)
 
     model = modeling.get_model(FLAGS.model_name)
     call_variants(
@@ -398,11 +384,14 @@ def main(argv=()):
         execution_hardware=FLAGS.execution_hardware,
         output_file=FLAGS.outfile,
         max_batches=FLAGS.max_batches,
-        batch_size=FLAGS.batch_size)
+        batch_size=FLAGS.batch_size,
+        master=master,
+        use_tpu=FLAGS.use_tpu,
+    )
 
 
 if __name__ == '__main__':
-  tf.flags.mark_flags_as_required([
+  flags.mark_flags_as_required([
       'examples',
       'outfile',
       'checkpoint',

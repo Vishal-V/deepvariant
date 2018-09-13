@@ -31,13 +31,14 @@
 
 // UnitTests for allelecounter.{h,cc}.
 #include "deepvariant/allelecounter.h"
+#include <numeric>
 
-#include "deepvariant/core/genomics/position.pb.h"
-#include "deepvariant/core/reference_fai.h"
-#include "deepvariant/core/reference_test.h"
-#include "deepvariant/core/test_utils.h"
-#include "deepvariant/core/utils.h"
 #include "deepvariant/utils.h"
+#include "third_party/nucleus/io/reference_fai.h"
+#include "third_party/nucleus/io/reference_test.h"
+#include "third_party/nucleus/protos/position.pb.h"
+#include "third_party/nucleus/testing/test_utils.h"
+#include "third_party/nucleus/util/utils.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/logging.h"
 
@@ -46,25 +47,26 @@
 #include <gmock/gmock-more-matchers.h>
 
 #include "tensorflow/core/platform/test.h"
-#include "deepvariant/testing/protocol-buffer-matchers.h"
+#include "third_party/nucleus/testing/protocol-buffer-matchers.h"
 
 namespace learning {
 namespace genomics {
 namespace deepvariant {
 
-using learning::genomics::v1::LinearAlignment;
-using learning::genomics::v1::Read;
-using core::GenomeReference;
-using core::TestFastaPath;
-using core::MakePosition;
-using core::MakeRange;
+using nucleus::EqualsProto;
+using nucleus::GenomeReference;
+using nucleus::MakePosition;
+using nucleus::MakeRange;
+using nucleus::TestFastaPath;
+using nucleus::genomics::v1::LinearAlignment;
+using nucleus::genomics::v1::Range;
+using nucleus::genomics::v1::Read;
 using tensorflow::strings::StrCat;
-using ::testing::UnorderedPointwise;
+using ::testing::Contains;
 using ::testing::Eq;
 using ::testing::IsEmpty;
-using ::testing::Contains;
-using learning::genomics::testing::EqualsProto;
 using ::testing::SizeIs;
+using ::testing::UnorderedPointwise;
 
 class AlleleCounterTest : public ::testing::Test {
  protected:
@@ -78,8 +80,9 @@ class AlleleCounterTest : public ::testing::Test {
 
   AlleleCounterTest() {
     const string& test_fasta_path = TestFastaPath();
-    ref_ = std::move(core::GenomeReferenceFai::FromFile(
-        test_fasta_path, StrCat(test_fasta_path, ".fai")).ValueOrDie());
+    ref_ = std::move(nucleus::GenomeReferenceFai::FromFile(
+                         test_fasta_path, StrCat(test_fasta_path, ".fai"))
+                         .ValueOrDie());
     read_ = MakeRead("chr1", 1, "TCCGTxx", {"5M"});
     options_.mutable_read_requirements()->set_min_base_quality(21);
   }
@@ -97,7 +100,7 @@ class AlleleCounterTest : public ::testing::Test {
   std::unique_ptr<AlleleCounter> MakeCounter(const string& chr,
                                              const int64 start,
                                              const int64 end) {
-    ::learning::genomics::v1::Range range = MakeRange(chr, start, end);
+    Range range = MakeRange(chr, start, end);
     // redacted
     // tensorflow/compiler/xla/ptr_util.h.
     return std::unique_ptr<AlleleCounter>(
@@ -185,7 +188,7 @@ class AlleleCounterTest : public ::testing::Test {
   // Creates a test Read with a unique read name.
   Read MakeRead(const string& chr, const int start, const string& bases,
                 const std::vector<string>& cigar_elements) {
-    Read read = core::MakeRead(chr, start, bases, cigar_elements);
+    Read read = nucleus::MakeRead(chr, start, bases, cigar_elements);
     // Each read gets a unique name.
     read.set_fragment_name(StrCat("read_", ++read_name_counter_));
     return read;
@@ -341,7 +344,7 @@ TEST_F(AlleleCounterTest, TestDiffInsertionSizes) {
   }
 }
 
-TEST_F(AlleleCounterTest, TestStartInsertion) {
+TEST_F(AlleleCounterTest, TestStartInsertionIsDroppedAtStartOfInterval) {
   // Starting insertion at the start of our interval gets dropped.
   AddAndCheckReads(MakeRead(chr_, start_, "AAATCCGT", {"3I", "5M"}),
                    {
@@ -351,7 +354,9 @@ TEST_F(AlleleCounterTest, TestStartInsertion) {
                        {MakeAllele("G", AlleleType::REFERENCE, 1)},
                        {MakeAllele("T", AlleleType::REFERENCE, 1)},
                    });
+}
 
+TEST_F(AlleleCounterTest, TestStartInsertionIsKeptWithinInterval) {
   // Starting an insertion is recorded when the read doesn't start at the start
   // of the interval.
   AddAndCheckReads(MakeRead(chr_, start_ + 1, "AAACCGT", {"3I", "4M"}),
@@ -451,7 +456,7 @@ TEST_F(AlleleCounterTest, TestStartingDeletions) {
                    });
 }
 
-TEST_F(AlleleCounterTest, TestEndingDeletions) {
+TEST_F(AlleleCounterTest, TestDeletionSpanningToEndOfInterval) {
   // It's no problem to have a deletion go up to the end of the interval.
   AddAndCheckReads(MakeRead(chr_, start_, "TCCG", {"4M", "1D"}),
                    {
@@ -461,7 +466,9 @@ TEST_F(AlleleCounterTest, TestEndingDeletions) {
                        {MakeAllele("GT", AlleleType::DELETION, 1)},
                        {},
                    });
+}
 
+TEST_F(AlleleCounterTest, TestDeletionSpanningOffInterval) {
   // We can have a deletion span off the interval, and it's handled properly.
   // Here our deletion spans 2 bp beyond the end of our interval.
   AddAndCheckReads(MakeRead(chr_, start_, "TCCG", {"4M", "3D"}),
@@ -602,6 +609,21 @@ TEST_F(AlleleCounterTest, TestDeletionAtChrStart) {
                        {MakeAllele("A", AlleleType::REFERENCE, 1)},
                    },
                    MakeCounter(chr_, chr_start, 4).get());
+}
+
+TEST_F(AlleleCounterTest, TestLowMapqReadsAreIgnored) {
+  Range range = MakeRange("chr1", 0, 4);
+  AlleleCounterOptions options;
+  options.mutable_read_requirements()->set_min_mapping_quality(10);
+  AlleleCounter allele_counter(ref_.get(), range, options);
+  auto read = MakeRead("chr1", 0, "ACGT", {"4M"});
+  read.mutable_alignment()->set_mapping_quality(0);
+  allele_counter.Add(read);
+
+  // Since the read has a mapping quality below our minimum, we have no counts.
+  for (int i = 0; i < 4; i++) {
+    EXPECT_THAT(TotalAlleleCounts(allele_counter.Counts()[i]), Eq(0));
+  }
 }
 
 TEST_F(AlleleCounterTest, TestMinBaseQualSNP) {

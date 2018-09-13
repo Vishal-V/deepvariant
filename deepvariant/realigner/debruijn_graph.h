@@ -32,24 +32,37 @@
 #ifndef LEARNING_GENOMICS_DEEPVARIANT_REALIGNER_DEBRUIJN_GRAPH_H_
 #define LEARNING_GENOMICS_DEEPVARIANT_REALIGNER_DEBRUIJN_GRAPH_H_
 
+#define HAS_FLAT_HASH_MAP 0
+
 #include <map>
 #include <memory>
 #include <vector>
 
-#include "deepvariant/core/genomics/reads.pb.h"
 #include "deepvariant/protos/realigner.pb.h"
+// redacted
+#if HAS_FLAT_HASH_MAP
+#include "absl/container/flat_hash_map.h"
+#endif
+#include "absl/strings/string_view.h"
 #include "boost/graph/adjacency_list.hpp"
 #include "boost/graph/graph_traits.hpp"
-#include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/lib/core/stringpiece.h"
+#include "third_party/nucleus/protos/reads.pb.h"
+// redacted
+#include "tensorflow/core/lib/hash/hash.h"
 
 namespace learning {
 namespace genomics {
 namespace deepvariant {
 
 using tensorflow::string;
-using tensorflow::StringPiece;
-using tensorflow::StringPieceHasher;
+
+// redacted
+// A hash function for absl::string_view objects.
+struct string_view_hasher {
+  size_t operator()(absl::string_view sp) const {
+    return static_cast<size_t>(::tensorflow::Hash64(sp.data(), sp.size()));
+  }
+};
 
 struct VertexInfo {
   string kmer;
@@ -83,7 +96,7 @@ class DeBruijnGraph {
   using VertexIndexMap =
       boost::const_associative_property_map<RawVertexIndexMap>;
 
-  using Options = RealignerOptions::DeBruijnGraphOptions;
+  using Options = DeBruijnGraphOptions;
 
  private:
   // Convenience method for rebuilding a table usable as the vertex_index_t
@@ -94,10 +107,10 @@ class DeBruijnGraph {
   VertexIndexMap IndexMap() const;
 
   // Ensure a vertex with label kmer is present--adding if necessary.
-  Vertex EnsureVertex(StringPiece kmer);
+  Vertex EnsureVertex(absl::string_view kmer);
 
   // Look up the vertex with this kmer label.
-  Vertex VertexForKmer(StringPiece kmer) const;
+  Vertex VertexForKmer(absl::string_view kmer) const;
 
   // Is this graph cyclic?
   bool HasCycle() const;
@@ -106,21 +119,30 @@ class DeBruijnGraph {
   // acyclic DeBruijn graphs.  Argument `k` is used to construct the graph;
   // filtering settings are taken from options.
   DeBruijnGraph(const string& ref,
-                const std::vector<learning::genomics::v1::Read>& reads,
+                const std::vector<nucleus::genomics::v1::Read>& reads,
                 const Options& options,
                 int k);
 
   // Add edge, implicitly adding the vertices if needed.  If such an edge is
   // already present, we merely increment its weight to reflect its "multiedge"
   // degree.
-  Edge AddEdge(StringPiece from, StringPiece to, bool is_ref);
+  Edge AddEdge(Vertex from_vertex, Vertex to_vertex, bool is_ref);
+
+  // Adds kmers from bases starting at start and stopping at end. We add a kmer
+  // at each i from start to end (inclusive), and edges between all sequential
+  // kmers. Since the first kmer spans k bases starting at start, start + k must
+  // be <= bases.size(). Since the last kmer we add starts at end and is k bases
+  // long, end + k <= bases.size() as well. Note that this function tolerates
+  // end < 0, which causes the code to return immediately.
+  void AddKmersAndEdges(absl::string_view bases, int start, int end,
+                        bool is_ref);
 
   // Add all the edges implied by the given reference string.
-  void AddEdgesForReference(StringPiece ref);
+  void AddEdgesForReference(absl::string_view ref);
 
   // Add all the edges implied by the given read (and according to our edge
   // filtering criteria).
-  void AddEdgesForRead(const learning::genomics::v1::Read& read);
+  void AddEdgesForRead(const nucleus::genomics::v1::Read& read);
 
   // Returns candidate haplotype paths through the graph.  If more that
   // options.max_num_paths paths are found, this will return an empty vector.
@@ -140,7 +162,7 @@ class DeBruijnGraph {
   // otherwise we return nullptr.
   static std::unique_ptr<DeBruijnGraph> Build(
       const string& ref,
-      const std::vector<learning::genomics::v1::Read>& reads,
+      const std::vector<nucleus::genomics::v1::Read>& reads,
       const Options& options);
 
   // Gets all the candidate haplotypes defined by paths through the graph.  If
@@ -160,10 +182,16 @@ class DeBruijnGraph {
   int k_;
   Vertex source_;
   Vertex sink_;
+
   // N.B.: kmer strings are owned by VertexInfo objects;
   // map keys are merely pointers.
-  std::unordered_map<StringPiece, Vertex, StringPieceHasher>
+// redacted
+#if HAS_FLAT_HASH_MAP
+  absl::flat_hash_map<absl::string_view, Vertex> kmer_to_vertex_;
+#else
+  std::unordered_map<absl::string_view, Vertex, string_view_hasher>
       kmer_to_vertex_;
+#endif
   RawVertexIndexMap vertex_index_map_;
 };
 

@@ -32,15 +32,15 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
 
 
+from absl.testing import absltest
 from absl.testing import parameterized
-import mock
 import numpy as np
 import six
 import tensorflow as tf
 
+from deepvariant import dv_constants
 from deepvariant import modeling
 
 slim = tf.contrib.slim
@@ -62,12 +62,12 @@ class ModelingTest(
     model = modeling.DeepVariantSlimModel(
         name='foo',
         n_classes_model_variable=['n_classes'],
-        excluded_scopes=['logits'],
+        excluded_scopes_for_incompatible_shapes=['logits'],
         pretrained_model_path='path')
 
     self.assertEqual('foo', model.name)
     self.assertEqual(['n_classes'], model.n_classes_model_variable)
-    self.assertEqual(['logits'], model.excluded_scopes)
+    self.assertEqual(['logits'], model.excluded_scopes_for_incompatible_shapes)
     self.assertEqual('path', model.pretrained_model_path)
 
   def test_variables_to_restore_from_model(self):
@@ -121,140 +121,57 @@ class HiddenFromUnitTest(object):
                          tf.test.TestCase)):
 
     @parameterized.parameters(
-        {
-            'is_training': True
-        },
-        {'is_training': False},
+        dict(is_training=True),
+        dict(is_training=False),
     )
     def test_create(self, is_training):
       # Creates a training=False model.
       self.assertEqual(len(tf.get_collection(tf.GraphKeys.UPDATE_OPS)), 0)
-      h, w = (100, 221)
-      images = tf.placeholder(tf.float32, (4, h, w, 3))
-      endpoints = self.model.create(images, 3, is_training=is_training)
+      images = tf.placeholder(
+          tf.float32,
+          (4, dv_constants.PILEUP_DEFAULT_HEIGHT,
+           dv_constants.PILEUP_DEFAULT_WIDTH, dv_constants.PILEUP_NUM_CHANNELS))
+      endpoints = self.model.create(
+          images, dv_constants.NUM_CLASSES, is_training=is_training)
       if is_training:
         self.assertNotEqual(len(tf.get_collection(tf.GraphKeys.UPDATE_OPS)), 0)
       else:
         self.assertEqual(len(tf.get_collection(tf.GraphKeys.UPDATE_OPS)), 0)
       self.assertIn('Predictions', endpoints)
-      self.assertEqual(endpoints['Predictions'].shape, (4, 3))
+      self.assertIn('Logits', endpoints)
+      self.assertEqual(endpoints['Predictions'].shape,
+                       (4, dv_constants.NUM_CLASSES))
 
-    def test_preprocess_image(self):
+    def test_preprocess_images(self):
       with self.test_session() as sess:
-        values = [91, 92, 93, 94, 95, 96]
-        raw = np.array(values, dtype='uint8').reshape((2, 1, 3))
-        image = sess.run(self.model.preprocess_image(raw))
+        batch_size = 3
+        values = range(91, 91 + 2 * 1 * dv_constants.PILEUP_NUM_CHANNELS)
+        all_values = values * batch_size
+        raw = np.array(
+            all_values, dtype='uint8').reshape(
+                (batch_size, 2, 1, dv_constants.PILEUP_NUM_CHANNELS))
+        images = sess.run(self.model.preprocess_images(raw))
+        for i in range(batch_size):
+          image = images[i]
 
-        # Check that our image has the right shape and that all values are
-        # floats between between -1 and 1.
-        self.assertEqual(tf.float32, image.dtype)
-        self.assertTrue((image >= -1).all() and (image <= 1).all())
-        # Check that the shape is the same, except for inception_v3 model we had
-        # to resize the height to at least 107.
-        if self.model.name == 'inception_v3':
-          self.assertEqual((107, 1, 3), image.shape)
-        else:
-          self.assertEqual((2, 1, 3), image.shape)
+          # Check that our image has the right shape and that all values are
+          # floats between between -1 and 1.
+          self.assertEqual(tf.float32, image.dtype)
+          self.assertTrue((image >= -1).all() and (image <= 1).all())
+          self.assertEqual((2, 1, dv_constants.PILEUP_NUM_CHANNELS),
+                           image.shape)
 
-        # The preprocess step resizes the image to h x w as needed by
-        # inception. We don't really care where it goes in the image (and the
-        # calculation is complex. So we are simply checking here that all values
-        # are zero except for the transformed values we see in values. We are
-        # relying here on the tf operations to be correct and to not change
-        # their behavior over time. Because we are doing assertEqual we are also
-        # testing the order of the values, which means that we are sure that the
-        # pixels have been translated in the right order in the image, wherever
-        # the actual translation might be.
-        self.assertEqual([(x - 128.0) / 128.0 for x in values],
-                         [x for x in np.nditer(image) if x != 0.0])
-
-    @parameterized.parameters([(3, True), (1000, True), (3, False)])
-    @mock.patch('deepvariant'
-                '.tf_utils.model_shapes')
-    def test_initialize_from_checkpoint(self, n_checkpoint_classes, is_training,
-                                        mock_model_shapes):
-
-      def _create_checkpoint(checkpoint_dir, decay_factor):
-        with self.test_session() as sess:
-          checkpoint_prefix = os.path.join(checkpoint_dir, 'model')
-          checkpoint_state_name = 'checkpoint'
-          v1_data = [10.0] * 12
-          v1 = slim.variables.Variable(v1_data, name='v1')
-          slim.add_model_variable(v1)
-          assign_to_v1 = v1.assign([20.0] * 12)
-          variable_averages = tf.train.ExponentialMovingAverage(
-              decay_factor, num_updates=999, zero_debias=False)
-          average_op = variable_averages.apply([v1])
-          v1_average = variable_averages.average(v1)
-          self.assertItemsEqual([v1], slim.variables.moving_average_variables())
-          self.assertEqual('v1/ExponentialMovingAverage:0', v1_average.name)
-          sess.run(slim.variables.global_variables_initializer())
-          sess.run(assign_to_v1)
-          sess.run(average_op)
-          saver = tf.train.Saver()
-          saver.save(
-              sess,
-              checkpoint_prefix,
-              global_step=3,
-              latest_filename=checkpoint_state_name)
-          return tf.train.latest_checkpoint(checkpoint_dir)
-
-      checkpoint_dir = self.get_temp_dir()
-      decay_factor = 0.9753
-      checkpoint_file = _create_checkpoint(checkpoint_dir, decay_factor)
-      n_prediction_classes = 3
-
-      mock_model_shapes.return_value = {
-          self.model.n_classes_model_variable: (n_checkpoint_classes,),
-      }
-      with self.test_session(graph=tf.Graph()) as sess:
-        self.assertItemsEqual([], slim.variables.moving_average_variables())
-        v1 = slim.variable_scope.get_variable('v1', [12])
-        slim.add_model_variable(v1)
-        sess.run(slim.variables.global_variables_initializer())
-        self.model.initialize_from_checkpoint(
-            checkpoint_file, n_prediction_classes, is_training)(
-                sess)
-        mock_model_shapes.assert_called_once_with(
-            checkpoint_file, [self.model.n_classes_model_variable])
-        v1_val = v1.eval(sess)
-        if is_training:
-          v1_expected = [20.0] * 12
-        else:
-          v1_expected = [10.0 * decay_factor + 20.0 * (1 - decay_factor)] * 12
-        self.assertAllClose(v1_expected, v1_val)
-
-    def test_initialize_from_checkpoint_fails_with_bad_path(self):
-      with self.assertRaisesRegexp(ValueError, 'Checkpoint cannot be None'):
-        self.model.initialize_from_checkpoint(None, 3, True)
-
-    @mock.patch('deepvariant.tf_utils.model_shapes')
-    def test_initialize_raises_inference_shape_mismatch(self,
-                                                        mock_model_shapes):
-      mock_model_shapes.return_value = {
-          self.model.n_classes_model_variable: (100,)
-      }
-      with self.assertRaisesRegexp(
-          ValueError, ('Checkpoint has 100 classes but we want to use 3 and '
-                       'is_training=False')):
-        self.model.initialize_from_checkpoint('path', 3, False)
-
-    @mock.patch('deepvariant'
-                '.modeling.slim.losses.softmax_cross_entropy')
-    @mock.patch('deepvariant'
-                '.modeling.slim.losses.get_total_loss')
-    def test_loss(self, mock_total_loss, mock_cross):
-      endpoints = {'Logits': 'Logits'}
-      labels = [[0, 1, 0], [1, 0, 0]]
-      actual = self.model.loss(endpoints, labels)
-      mock_total_loss.assert_called_once_with()
-      self.assertEqual(actual, mock_total_loss.return_value)
-      # We really only want to test that the endpoints and labels are being
-      # passed in correctly, without specifying all of the additional keywords
-      # again here like weight that can change without breaking the correctness
-      # of loss.
-      self.assertEqual([('Logits', labels)],
-                       [args for args, _ in mock_cross.call_args_list])
+          # The preprocess step resizes the image to h x w as needed by
+          # inception. We don't really care where it goes in the image (and the
+          # calculation is complex. So we are simply checking here that all
+          # values are zero except for the transformed values we see in values.
+          # We are relying here on the tf operations to be correct and to not
+          # change their behavior over time. Because we are doing assertEqual
+          # we are also testing the order of the values, which means that we
+          # are sure that the pixels have been translated in the right order in
+          # the image, wherever the actual translation might be.
+          self.assertEqual([(x - 128.0) / 128.0 for x in values],
+                           [x for x in np.nditer(image) if x != 0.0])
 
 
 class InceptionV3ModelTest(HiddenFromUnitTest.SlimModelBaseTest):
@@ -263,19 +180,40 @@ class InceptionV3ModelTest(HiddenFromUnitTest.SlimModelBaseTest):
   def setUpClass(cls):
     cls.model = modeling.get_model('inception_v3')
 
+  # Note this test is only applied to inception_v3 since v2 and mobilenet don't
+  # support some of these dimensions.
+  @parameterized.parameters(
+      dict(width=221, height=100),
+      dict(width=221, height=200),
+      dict(width=75, height=362),
+  )
+  def test_image_dimensions(self, width, height):
+    with self.test_session():
+      images = tf.placeholder(tf.float32, (4, height, width, 3))
+      # We shouldn't get an exception creating images with these sizes.
+      _ = self.model.create(images, 3, is_training=True)
+
+  @parameterized.parameters(
+      dict(width=73, height=100),
+      dict(width=221, height=2000),
+      dict(width=73, height=2000),
+  )
+  def test_bad_inception_v3_image_dimensions_get_custom_exception(
+      self, width, height):
+    with self.test_session():
+      images = tf.placeholder(tf.float32, (4, height, width, 3))
+      expected_message = ('Unsupported image dimensions.* model '
+                          'inception_v3.*w={} x h={}.*').format(width, height)
+      with self.assertRaisesRegexp(modeling.UnsupportedImageDimensions,
+                                   expected_message):
+        self.model.create(images, 3, is_training=True)
+
 
 class InceptionV2ModelTest(HiddenFromUnitTest.SlimModelBaseTest):
 
   @classmethod
   def setUpClass(cls):
     cls.model = modeling.get_model('inception_v2')
-
-
-class Resnet50ModelTest(HiddenFromUnitTest.SlimModelBaseTest):
-
-  @classmethod
-  def setUpClass(cls):
-    cls.model = modeling.get_model('resnet_v2_50')
 
 
 class MobileNetModelTest(HiddenFromUnitTest.SlimModelBaseTest):
@@ -302,4 +240,4 @@ class RandomGuessModelTest(tf.test.TestCase):
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  absltest.main()
