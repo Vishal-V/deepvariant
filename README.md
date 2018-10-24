@@ -3,6 +3,38 @@
 DeepVariant is an analysis pipeline that uses a deep neural network to call
 genetic variants from next-generation DNA sequencing data.
 
+## Why DeepVariant
+
+*   DeepVariant is **highly accurate**. In 2016 DeepVariant won
+    [PrecisionFDA Truth Challenge](https://precision.fda.gov/challenges/truth/results)
+    in the best SNP Performance category.
+*   DeepVariant is **robust**. DeepVariant maintains high accuracy even for
+    error-prone sequencing conditions, including
+    [PCR-positive](https://ai.googleblog.com/2018/04/deepvariant-accuracy-improvements-for.html)
+    samples and
+    [low quality sequencing runs](https://blog.dnanexus.com/2018-01-16-evaluating-the-performance-of-ngs-pipelines-on-noisy-wgs-data/).
+*   DeepVariant is **fast**. Using
+    [Google Cloud Platform](https://cloud.google.com/genomics/deepvariant), a
+    whole human genome<sup>[(1)](#myfootnote1)</sup> analysis completes in as
+    little as ~70 minutes<sup>[(2)](#myfootnote2)</sup> and an exome in ~25
+    minutes.
+*   DeepVariant is **cost-efficient**. Using
+    [Google Cloud Platform](https://cloud.google.com/genomics/deepvariant),
+    calling a whole genome costs ~$2-3 and an exome $0.20.
+*   DeepVariant is **flexible**. DeepVariant can be easily adjusted or used out
+    of the box for
+    [different sequencing technologies](https://github.com/google/deepvariant/blob/r0.7/docs/deepvariant-tpu-training-case-study.md)
+    and even for
+    [non-human species](http://news.irri.org/2018/01/international-rice-informatics.html).
+*   DeepVariant is **easy to use**. No filtering is needed beyond setting your
+    preferred minimum quality threshold.
+*   DeepVariant is **where you need it**. It builds and runs on-premises and in
+    the cloud, as a stand-alone binary or a Docker image, and makes use of
+    hardware accelerators like GPUs and TPUs.
+
+<a name="myfootnote1">(1)</a>: Examples assume 30x coverage.
+<a name="myfootnote2">(2)</a>: Time estimates do not include mapping.
+
 ## Availability
 
 <!-- mdlint off(URL_BAD_G3DOC_PATH) -->
@@ -78,8 +110,8 @@ Cloud Platform.
 <a name="about"></a>
 ## About DeepVariant
 
-For technical details describing how DeepVariant works please see our
-[preprint](https://doi.org/10.1101/092890).
+For technical details describing how DeepVariant works please see our [Nature
+Biotechnology publication](https://rdcu.be/7Dhl).
 
 ![DeepVariant workflow](docs/DeepVariant-workflow-figure.png?raw=true "DeepVariant workflow")
 
