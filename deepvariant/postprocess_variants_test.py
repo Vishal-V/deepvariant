@@ -37,28 +37,49 @@ import itertools
 import sys
 
 
+from absl import flags
+from absl import logging
 from absl.testing import absltest
 from absl.testing import parameterized
 import mock
 import numpy as np
 import tensorflow as tf
 
-from absl import logging
+from third_party.nucleus.io import fasta
+from third_party.nucleus.protos import reference_pb2
+from third_party.nucleus.protos import struct_pb2
+from third_party.nucleus.protos import variants_pb2
+from third_party.nucleus.testing import test_utils
+from third_party.nucleus.util import genomics_math
+from third_party.nucleus.util import io_utils
+from third_party.nucleus.util import vcf_constants
+from deepvariant import dv_vcf_constants
 from deepvariant import postprocess_variants
-from deepvariant import test_utils
-from deepvariant.core import io_utils
-from deepvariant.core import math
-from deepvariant.core.genomics import variants_pb2
+from deepvariant import testdata
 from deepvariant.protos import deepvariant_pb2
 from deepvariant.testing import flagsaver
 
-FLAGS = tf.flags.FLAGS
+FLAGS = flags.FLAGS
 
 _DEFAULT_SAMPLE_NAME = 'NA12878'
 
+# Test contigs for gVCF merging code.
+_CONTIGS = [
+    reference_pb2.ContigInfo(name='1', n_bases=100),
+    reference_pb2.ContigInfo(name='2', n_bases=200),
+    reference_pb2.ContigInfo(name='10', n_bases=300),
+]
+
+
+def dummy_reference_reader():
+  return fasta.InMemoryRefReader(chromosomes=[
+      ('1', 0, 'AACCGGTTACGTTCGATTTTAAAACCCCGGGG'),
+      ('2', 0, 'GCAGTGACGTAGCGATGACGTAGACGCTTACG'),
+  ])
+
 
 def setUpModule():
-  test_utils.init()
+  testdata.init()
 
 
 def _create_variant(ref_name, start, ref_base, alt_bases, qual, filter_field,
@@ -91,11 +112,12 @@ def _create_variant(ref_name, start, ref_base, alt_bases, qual, filter_field,
       sample_name=_DEFAULT_SAMPLE_NAME)
 
 
-def _create_variant_with_alleles(ref=None, alts=None):
+def _create_variant_with_alleles(ref=None, alts=None, start=0):
   """Creates a Variant record with specified alternate_bases."""
   return variants_pb2.Variant(
       reference_bases=ref,
       alternate_bases=alts,
+      start=start,
       calls=[variants_pb2.VariantCall(call_set_name=_DEFAULT_SAMPLE_NAME)])
 
 
@@ -115,16 +137,53 @@ def _create_call_variants_output(indices,
       variant=variant)
 
 
+def _simple_variant(ref_name, start, ref_base):
+  """Creates a Variant record for testing variant and non-variant merge.
+
+  Args:
+    ref_name: str. Reference name for this variant.
+    start: int. start position on the contig [0-based, half open).
+    ref_base: str. reference base(s).
+
+  Returns:
+    A Variant record created with the specified arguments.
+  """
+  return test_utils.make_variant(
+      chrom=ref_name,
+      start=start,
+      end=start + len(ref_base),
+      alleles=[ref_base, 'A' if ref_base != 'A' else 'C'])
+
+
+def _create_nonvariant(ref_name, start, end, ref_base):
+  """Creates a non-variant Variant record for testing.
+
+  Args:
+    ref_name: str. Reference name for this variant.
+    start: int. start position on the contig [0-based, half open).
+    end: int. end position on the contig [0-based, half open).
+    ref_base: str. reference base at the start position.
+
+  Returns:
+    A non-variant Variant record created with the specified arguments.
+  """
+  return test_utils.make_variant(
+      chrom=ref_name,
+      start=start,
+      end=end,
+      alleles=[ref_base, vcf_constants.GVCF_ALT_ALLELE])
+
+
 def make_golden_dataset(compressed_inputs=False):
   if compressed_inputs:
     source_path = test_utils.test_tmpfile(
         'golden.postprocess_single_site_input.tfrecord.gz')
     io_utils.write_tfrecords(
         io_utils.read_tfrecords(
-            test_utils.GOLDEN_POSTPROCESS_INPUT,
+            testdata.GOLDEN_POSTPROCESS_INPUT,
             proto=deepvariant_pb2.CallVariantsOutput), source_path)
   else:
-    source_path = test_utils.GOLDEN_POSTPROCESS_INPUT
+    source_path = testdata.GOLDEN_POSTPROCESS_INPUT
   return source_path
 
 
@@ -172,14 +231,20 @@ class PostprocessVariantsTest(parameterized.TestCase):
   @flagsaver.FlagSaver
   def test_call_end2end(self, compressed_inputs):
     FLAGS.infile = make_golden_dataset(compressed_inputs)
-    FLAGS.ref = test_utils.CHR20_FASTA
+    FLAGS.ref = testdata.CHR20_FASTA
     FLAGS.outfile = test_utils.test_tmpfile('calls.vcf')
+    FLAGS.nonvariant_site_tfrecord_path = (
+        testdata.GOLDEN_POSTPROCESS_GVCF_INPUT)
+    FLAGS.gvcf_outfile = test_utils.test_tmpfile('gvcf_calls.vcf')
 
     postprocess_variants.main(['postprocess_variants.py'])
 
     self.assertEqual(
         tf.gfile.FastGFile(FLAGS.outfile).readlines(),
-        tf.gfile.FastGFile(test_utils.GOLDEN_POSTPROCESS_OUTPUT).readlines())
+        tf.gfile.FastGFile(testdata.GOLDEN_POSTPROCESS_OUTPUT).readlines())
+    self.assertEqual(
+        tf.gfile.FastGFile(FLAGS.gvcf_outfile).readlines(),
+        tf.gfile.FastGFile(testdata.GOLDEN_POSTPROCESS_GVCF_OUTPUT).readlines())
 
   def test_extract_single_variant_name(self):
     record = _create_call_variants_output(
@@ -198,7 +263,7 @@ class PostprocessVariantsTest(parameterized.TestCase):
     ]
     variant = variants_pb2.Variant(calls=variant_calls)
     record = deepvariant_pb2.CallVariantsOutput(variant=variant)
-    with self.assertRaisesRegexp(ValueError, 'Error extracting name:'):
+    with self.assertRaisesRegexp(ValueError, 'Expected exactly one VariantCal'):
       postprocess_variants._extract_single_sample_name(record)
 
   @parameterized.parameters(
@@ -436,40 +501,40 @@ class PostprocessVariantsTest(parameterized.TestCase):
   @parameterized.parameters(
       ([0.01, 0.0, 0.99],
        _create_variant('GL000220.1', 1, 'A', ['.'], 20.0,
-                       postprocess_variants.DEEP_VARIANT_PASS, [1, 1], 20,
+                       dv_vcf_constants.DEEP_VARIANT_PASS, [1, 1], 20,
                        [-2.0, -15.0003472607, -0.0043648054])),
       ([0.01, 0.0, 0.99],
        _create_variant('GL000220.1', 10000210, 'C', ['T'], 20.0,
-                       postprocess_variants.DEEP_VARIANT_PASS, [1, 1], 20,
+                       dv_vcf_constants.DEEP_VARIANT_PASS, [1, 1], 20,
                        [-2.0, -15.0003472607, -0.0043648054])),
       ([0.001, 0.999, 0.0],
        _create_variant('20', 10000210, 'C', ['CT'], 30.0,
-                       postprocess_variants.DEEP_VARIANT_PASS, [0, 1], 30,
+                       dv_vcf_constants.DEEP_VARIANT_PASS, [0, 1], 30,
                        [-3.0, -0.00043451177, -15.0003472607])),
       ([0.0001, 0.0, 0.9999],
        _create_variant('1', 1, 'C', ['T'], 40.0,
-                       postprocess_variants.DEEP_VARIANT_PASS, [1, 1], 40,
+                       dv_vcf_constants.DEEP_VARIANT_PASS, [1, 1], 40,
                        [-4.0, -15.0003472607, -0.00004343161])),
       ([0.1, 0.90, 0.0],
        _create_variant('20', 10000210, 'A', ['T'], 10.0,
-                       postprocess_variants.DEEP_VARIANT_PASS, [0, 1], 10,
+                       dv_vcf_constants.DEEP_VARIANT_PASS, [0, 1], 10,
                        [-1.0, -0.04575749056, -15.0003472607])),
       ([0.99, 0.005, 0.005],
        _create_variant('X', 10000210, 'CACA', ['C'], 0.04364805402,
-                       postprocess_variants.DEEP_VARIANT_REF_FILTER, [0, 0], 20,
+                       dv_vcf_constants.DEEP_VARIANT_REF_FILTER, [0, 0], 20,
                        [-0.0043648054, -2.30102999566, -2.30102999566])),
       ([0.9999, 0.0001, 0.0],
        _create_variant('chrY', 10000210, 'C', ['T'], 0.00043431619,
-                       postprocess_variants.DEEP_VARIANT_REF_FILTER, [0, 0], 40,
+                       dv_vcf_constants.DEEP_VARIANT_REF_FILTER, [0, 0], 40,
                        [-0.00004343161, -4.0, -15.0003472607])),
       # Multi-allelic test examples.
       ([0.995, 0.001, 0.001, 0.001, 0.001, 0.001],
        _create_variant('X', 10000210, 'CACA', ['C', 'A'], 0.0217691925,
-                       postprocess_variants.DEEP_VARIANT_REF_FILTER, [0, 0], 23,
+                       dv_vcf_constants.DEEP_VARIANT_REF_FILTER, [0, 0], 23,
                        [-0.00217691925, -3, -3, -3, -3, -3])),
       ([0.001, 0.001, 0.001, 0.995, 0.001, 0.001],
        _create_variant('X', 10000210, 'CACA', ['C', 'A'], 30,
-                       postprocess_variants.DEEP_VARIANT_PASS, [0, 2], 23,
+                       dv_vcf_constants.DEEP_VARIANT_PASS, [0, 2], 23,
                        [-3, -3, -3, -0.00217691925, -3, -3])),
   )
   def test_add_call_to_variant(self, probs, expected):
@@ -576,7 +641,8 @@ class PostprocessVariantsTest(parameterized.TestCase):
   )
   def test_compute_quals_numerical_stability(self, probs, call, expected_gq):
     max_qual = round(
-        math.ptrue_to_bounded_phred(1.0), postprocess_variants._QUAL_PRECISION)
+        genomics_math.ptrue_to_bounded_phred(1.0),
+        postprocess_variants._QUAL_PRECISION)
     gq, qual = postprocess_variants.compute_quals(probs, call)
     self.assertEquals(expected_gq, gq)
     self.assertEquals(max_qual, qual)
@@ -609,8 +675,8 @@ class PostprocessVariantsTest(parameterized.TestCase):
       variant = variants_pb2.Variant()
       variant.quality = qual
       expected = []
-      expected.append(postprocess_variants.DEEP_VARIANT_PASS if qual >= min_qual
-                      else postprocess_variants.DEEP_VARIANT_QUAL_FILTER)
+      expected.append(dv_vcf_constants.DEEP_VARIANT_PASS if qual >= min_qual
+                      else dv_vcf_constants.DEEP_VARIANT_QUAL_FILTER)
       self.assertEqual(
           postprocess_variants.compute_filter_fields(variant, min_qual),
           expected)
@@ -618,7 +684,7 @@ class PostprocessVariantsTest(parameterized.TestCase):
       del variant.filter[:]
       variant.calls.add(genotype=[0, 0])
       expected = []
-      expected.append(postprocess_variants.DEEP_VARIANT_REF_FILTER)
+      expected.append(dv_vcf_constants.DEEP_VARIANT_REF_FILTER)
       self.assertEqual(
           postprocess_variants.compute_filter_fields(variant, min_qual),
           expected)
@@ -627,8 +693,8 @@ class PostprocessVariantsTest(parameterized.TestCase):
       del variant.calls[:]
       variant.calls.add(genotype=[0, 1])
       expected = []
-      expected.append(postprocess_variants.DEEP_VARIANT_PASS if qual >= min_qual
-                      else postprocess_variants.DEEP_VARIANT_QUAL_FILTER)
+      expected.append(dv_vcf_constants.DEEP_VARIANT_PASS if qual >= min_qual
+                      else dv_vcf_constants.DEEP_VARIANT_QUAL_FILTER)
       self.assertEqual(
           postprocess_variants.compute_filter_fields(variant, min_qual),
           expected)
@@ -732,21 +798,45 @@ class PostprocessVariantsTest(parameterized.TestCase):
   @parameterized.parameters(
       # Check that we are simplifying alleles and that the simplification deps
       # on the alleles we've removed.
-      (['CAA', 'CA', 'C'], [], ['CAA', 'CA', 'C']),
+      dict(
+          alleles=['CAA', 'CA', 'C'],
+          start=5,
+          alt_alleles_to_remove=[],
+          expected_alleles=['CAA', 'CA', 'C'],
+          expected_end=8),
       # Removing the C allele allows us to simplify CAA + CA => CA + C.
-      (['CAA', 'CA', 'C'], ['C'], ['CA', 'C']),
-      # Removing the CA allele doens't allow any simplification.
-      (['CAA', 'CA', 'C'], ['CA'], ['CAA', 'C']),
+      dict(
+          alleles=['CAA', 'CA', 'C'],
+          start=4,
+          alt_alleles_to_remove=['C'],
+          expected_alleles=['CA', 'C'],
+          expected_end=6),
+      # Removing the CA allele doesn't allow any simplification.
+      dict(
+          alleles=['CAA', 'CA', 'C'],
+          start=3,
+          alt_alleles_to_remove=['CA'],
+          expected_alleles=['CAA', 'C'],
+          expected_end=6),
       # Make sure we keep at least one anchor base when pruning.
-      (['CCA', 'CA', 'T'], ['T'], ['CC', 'C']),
+      dict(
+          alleles=['CCA', 'CA', 'T'],
+          start=2,
+          alt_alleles_to_remove=['T'],
+          expected_alleles=['CC', 'C'],
+          expected_end=4),
   )
-  def test_simplify_alleles(self, alleles, alt_alleles_to_remove, expected):
+  def test_simplify_alleles(self, alleles, start, alt_alleles_to_remove,
+                            expected_alleles, expected_end):
     """Test that prune_alleles + simplify_alleles works as expected."""
-    variant = _create_variant_with_alleles(ref=alleles[0], alts=alleles[1:])
+    variant = _create_variant_with_alleles(
+        ref=alleles[0], alts=alleles[1:], start=start)
     pruned = postprocess_variants.prune_alleles(variant, alt_alleles_to_remove)
     simplified = postprocess_variants.simplify_alleles(pruned)
-    self.assertEqual(simplified.reference_bases, expected[0])
-    self.assertEqual(simplified.alternate_bases, expected[1:])
+    self.assertEqual(simplified.reference_bases, expected_alleles[0])
+    self.assertEqual(simplified.alternate_bases, expected_alleles[1:])
+    self.assertEqual(simplified.start, start)
+    self.assertEqual(simplified.end, expected_end)
 
   def test_merge_predictions_simplifies_alleles(self):
     """Checks that merge_predictions simplifies alleles."""
@@ -781,9 +871,8 @@ class PostprocessVariantsTest(parameterized.TestCase):
     variant = _create_variant_with_alleles(alts=alts)
     test_utils.set_list_values(variant.calls[0].info['AD'], orig_ad)
     actual = postprocess_variants.prune_alleles(variant, to_remove)
-    self.assertEqual(
-        [v.number_value for v in actual.calls[0].info['AD'].values],
-        expected_ad)
+    self.assertEqual([v.int_value for v in actual.calls[0].info['AD'].values],
+                     expected_ad)
 
   @parameterized.parameters(
       (1, [[0]]),
@@ -805,7 +894,7 @@ class PostprocessVariantsTest(parameterized.TestCase):
   def test_catches_bad_argv(self):
     # Define valid flags to ensure raise occurs due to argv issues.
     FLAGS.infile = make_golden_dataset(False)
-    FLAGS.ref = test_utils.CHR20_FASTA
+    FLAGS.ref = testdata.CHR20_FASTA
     FLAGS.outfile = test_utils.test_tmpfile('nonempty_outfile.vcf')
     with mock.patch.object(logging, 'error') as mock_logging,\
         mock.patch.object(sys, 'exit') as mock_exit:
@@ -815,6 +904,224 @@ class PostprocessVariantsTest(parameterized.TestCase):
         'positional arguments but some are present on the command line: '
         '"[\'postprocess_variants.py\', \'extra_arg\']".')
     mock_exit.assert_called_once_with(errno.ENOENT)
+
+  @flagsaver.FlagSaver
+  def test_catches_bad_flags(self):
+    FLAGS.infile = make_golden_dataset(False)
+    FLAGS.ref = testdata.CHR20_FASTA
+    FLAGS.outfile = 'nonempty_outfile.vcf'
+    FLAGS.nonvariant_site_tfrecord_path = (
+        testdata.GOLDEN_POSTPROCESS_GVCF_INPUT)
+    # This is the bad flag.
+    FLAGS.gvcf_outfile = ''
+    with mock.patch.object(logging, 'error') as mock_logging, \
+        mock.patch.object(sys, 'exit') as mock_exit:
+      postprocess_variants.main(['postprocess_variants.py'])
+    mock_logging.assert_called_once_with(
+        'gVCF creation requires both nonvariant_site_tfrecord_path and '
+        'gvcf_outfile flags to be set.')
+    mock_exit.assert_called_once_with(errno.ENOENT)
+
+
+class MergeVcfAndGvcfTest(parameterized.TestCase):
+
+  @parameterized.parameters(
+      # Smaller chromosome should return less than.
+      (('1', 10, 20), ('2', 1, 2), True),
+      (('2', 10, 20), ('10', 1, 2), True),
+      # Larger chromosome should not return less than.
+      (('2', 1, 2), ('1', 10, 20), False),
+      (('10', 1, 2), ('2', 10, 20), False),
+      # Same chromosome, smaller.
+      (('1', 1, 2), ('1', 3, 4), True),
+      (('1', 1, 3), ('1', 3, 4), True),
+      # Same chromosome, overlapping.
+      (('1', 1, 4), ('1', 3, 6), False),
+      (('1', 1, 9), ('1', 3, 6), False),
+      (('1', 4, 9), ('1', 3, 6), False),
+      # Same chromosome, larger.
+      (('1', 6, 9), ('1', 3, 4), False),
+  )
+  def test_lessthan_comparison(self, v1, v2, expected):
+    variant1 = _create_nonvariant(*v1, ref_base='A')
+    variant2 = _create_nonvariant(*v2, ref_base='C')
+    lessthan = postprocess_variants._get_contig_based_lessthan(_CONTIGS)
+    self.assertEqual(lessthan(variant1, variant2), expected)
+    self.assertEqual(lessthan(variant1, None), True)
+    self.assertEqual(lessthan(None, variant1), False)
+
+  @parameterized.parameters(
+      (_create_nonvariant('1', 10, 15, 'G'), 10, 12,
+       _create_nonvariant('1', 10, 12, 'G')),
+      (_create_nonvariant('2', 1, 9, 'C'), 3, 4,
+       _create_nonvariant('2', 3, 4, 'G')),
+  )
+  def test_create_record_from_template(self, template, start, end, expected):
+    reader = dummy_reference_reader()
+    actual = postprocess_variants._create_record_from_template(
+        template, start, end, reader)
+    self.assertEqual(actual, expected)
+
+  @parameterized.parameters(
+      # One alt, with het GLs.
+      (['C'], [-2.0457574905606752, -0.004364805402450088, -3.0], [0.75]),
+      # Multi alts.
+      (['G', 'C'], [
+          -1.1368906918484387, -0.5279124552610386, -0.5923808731731073,
+          -0.8155431286425007, -0.8415961054266092, -1.108308924501657
+      ], [0.5, 0.1]),
+      (['G', 'C', 'T'], [
+          -0.7956722868920258, -0.663917423732382, -1.493986734511771,
+          -0.8202531343562444, -0.9377869397242453, -1.0415699718993066,
+          -1.4176189291054515, -1.5795151893394743, -1.8101482990393198,
+          -0.8139951558313916
+      ], [0.5, 0.1, 0.05]),
+  )
+  def test_transform_to_gvcf_add_allele(self, prior_alts, prior_gls, prior_vaf):
+    variant = _create_variant(
+        ref_name='chr1',
+        start=10,
+        ref_base='A',
+        alt_bases=prior_alts,
+        qual=40,
+        filter_field='PASS',
+        genotype=[0, 1],
+        gq=None,
+        likelihoods=prior_gls)
+    prior_vaf_values = [struct_pb2.Value(number_value=v) for v in prior_vaf]
+    variant.calls[0].info['VAF'].values.extend(prior_vaf_values)
+    expected = _create_variant(
+        ref_name='chr1',
+        start=10,
+        ref_base='A',
+        alt_bases=prior_alts + [vcf_constants.GVCF_ALT_ALLELE],
+        qual=40,
+        filter_field='PASS',
+        genotype=[0, 1],
+        gq=None,
+        likelihoods=prior_gls + ([postprocess_variants._GVCF_ALT_ALLELE_GL] *
+                                 (len(prior_alts) + 2)))
+    expected.calls[0].info['VAF'].values.extend(
+        prior_vaf_values + [struct_pb2.Value(number_value=0)])
+    actual = postprocess_variants._transform_to_gvcf_record(variant)
+    self.assertEqual(actual, expected)
+
+  @parameterized.parameters(
+      # One alt, with het GLs.
+      ([vcf_constants.GVCF_ALT_ALLELE],
+       [-2.0457574905606752, -0.004364805402450088, -3.0], [0.5]),
+      # Multi alts.
+      (['G', vcf_constants.GVCF_ALT_ALLELE], [
+          -1.1368906918484387, -0.5279124552610386, -0.5923808731731073,
+          -0.8155431286425007, -0.8415961054266092, -1.108308924501657
+      ], [0.5, 0.1]),
+      (['G', 'C', vcf_constants.GVCF_ALT_ALLELE], [
+          -0.7956722868920258, -0.663917423732382, -1.493986734511771,
+          -0.8202531343562444, -0.9377869397242453, -1.0415699718993066,
+          -1.4176189291054515, -1.5795151893394743, -1.8101482990393198,
+          -0.8139951558313916
+      ], [0, 0.5, 0.1]),
+  )
+  def test_transform_to_gvcf_no_allele_addition(self, alts, gls, vaf):
+    variant = _create_variant(
+        ref_name='chr1',
+        start=10,
+        ref_base='A',
+        alt_bases=alts,
+        qual=40,
+        filter_field='PASS',
+        genotype=[0, 1],
+        gq=None,
+        likelihoods=gls)
+    vaf_values = [struct_pb2.Value(number_value=v) for v in vaf]
+    variant.calls[0].info['VAF'].values.extend(vaf_values)
+    expected = variants_pb2.Variant()
+    expected.CopyFrom(variant)
+    actual = postprocess_variants._transform_to_gvcf_record(variant)
+    self.assertEqual(actual, expected)
+
+  @parameterized.parameters(
+      # Simple inputs.
+      # Empty.
+      ([], [], []),
+      # Non-overlapping records.
+      ([('1', 1, 'A')], [], [_simple_variant('1', 1, 'A')]),
+      ([('1', 3, 'C'), ('1', 7, 'T'),
+        ('2', 6, 'A')], [('2', 3, 6, 'G'), ('2', 7, 9, 'C')], [
+            _simple_variant('1', 3, 'C'),
+            _simple_variant('1', 7, 'T'),
+            _create_nonvariant('2', 3, 6, 'G'),
+            _simple_variant('2', 6, 'A'),
+            _create_nonvariant('2', 7, 9, 'C')
+        ]),
+      # Non-variant record overlaps a variant from the left.
+      ([('1', 5, 'GTTACG')], [('1', 2, 8, 'C')],
+       [_create_nonvariant('1', 2, 5, 'C'),
+        _simple_variant('1', 5, 'GTTACG')]),
+      # Non-variant record overlaps a variant from the right.
+      ([('1', 5, 'GTTACG')], [('1', 8, 15, 'A')], [
+          _simple_variant('1', 5, 'GTTACG'),
+          _create_nonvariant('1', 11, 15, 'T')
+      ]),
+      # Non-variant record is subsumed by a variant.
+      ([('1', 5, 'GTTACG')], [('1', 5, 11, 'G')],
+       [_simple_variant('1', 5, 'GTTACG')]),
+      # Non-variant record subsumes a variant.
+      ([('1', 5, 'GTTACG')], [('1', 4, 12, 'G')], [
+          _create_nonvariant('1', 4, 5, 'G'),
+          _simple_variant('1', 5, 'GTTACG'),
+          _create_nonvariant('1', 11, 12, 'T')
+      ]),
+      # Non-variant record subsumes multiple overlapping variants.
+      ([('1', 3, 'CGGTTAC'), ('1', 5, 'G')], [('1', 1, 15, 'A')], [
+          _create_nonvariant('1', 1, 3, 'A'),
+          _simple_variant('1', 3, 'CGGTTAC'),
+          _simple_variant('1', 5, 'G'),
+          _create_nonvariant('1', 10, 15, 'G')
+      ]),
+      ([('1', 3, 'CGGTTAC'), ('1', 5, 'GTTACGT')], [('1', 1, 15, 'A')], [
+          _create_nonvariant('1', 1, 3, 'A'),
+          _simple_variant('1', 3, 'CGGTTAC'),
+          _simple_variant('1', 5, 'GTTACGT'),
+          _create_nonvariant('1', 12, 15, 'T')
+      ]),
+  )
+  def test_merge_variants_and_nonvariants(self, variants, nonvariants,
+                                          expected):
+    viter = (_simple_variant(*v) for v in variants)
+    nonviter = (_create_nonvariant(*nv) for nv in nonvariants)
+    lessthan = postprocess_variants._get_contig_based_lessthan(_CONTIGS)
+    reader = dummy_reference_reader()
+    actual = postprocess_variants.merge_variants_and_nonvariants(
+        viter, nonviter, lessthan, reader)
+    self.assertEqual(list(actual), expected)
+
+  # redacted
+  def test_sort_grouped_variants(self):
+    group = [
+        _create_call_variants_output(
+            indices=[0, 1],
+            probabilities=[0.98, 0.02, 0],
+            variant=_create_variant_with_alleles(ref='CA', alts=['C', 'CAA'])),
+        _create_call_variants_output(
+            indices=[1],
+            probabilities=[0.995, 0.005, 0],
+            variant=_create_variant_with_alleles(ref='CA', alts=['C', 'CAA'])),
+        _create_call_variants_output(
+            indices=[0],
+            probabilities=[0.95, 0.05, 0],
+            variant=_create_variant_with_alleles(ref='CA', alts=['C', 'CAA'])),
+    ]
+    output = postprocess_variants._sort_grouped_variants(group)
+    # In sorted output, 1st has indices=[0].
+    self.assertEqual(output[0], group[2])
+    self.assertEqual(output[0].alt_allele_indices.indices, [0])
+    # In sorted output, 2nd has indices=[0, 1].
+    self.assertEqual(output[1], group[0])
+    self.assertEqual(output[1].alt_allele_indices.indices, [0, 1])
+    # In sorted output, 3rd has indices=[1].
+    self.assertEqual(output[2], group[1])
+    self.assertEqual(output[2].alt_allele_indices.indices, [1])
 
 
 if __name__ == '__main__':

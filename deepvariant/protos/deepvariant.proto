@@ -29,10 +29,11 @@
 
 syntax = "proto3";
 
-import "deepvariant/core/genomics/position.proto";
-import "deepvariant/core/genomics/variants.proto";
-import "deepvariant/core/protos/core.proto";
+import "third_party/nucleus/protos/position.proto";
+import "third_party/nucleus/protos/reads.proto";
+import "third_party/nucleus/protos/variants.proto";
 import "deepvariant/protos/realigner.proto";
+import "deepvariant/protos/resources.proto";
 
 
 package learning.genomics.deepvariant;
@@ -86,7 +87,7 @@ message Allele {
 
   // The number of times this Allele was seen in the NGS data. The count
   // should be >= 0, where 0 indicates that no observations of the allele
-  // where observed (which can happen if you want to record that you checked
+  // were observed (which can happen if you want to record that you checked
   // for some allele in the data and never saw any evidence for it).
   int32 count = 3;
 }
@@ -185,7 +186,7 @@ message Allele {
 //
 // coverage =
 //    // reads supporting an observed alternate allele.
-//    sum(read_allele_i.count)      // [also equal to read_allele_size()]
+//    sum(read_allele_i.count)      // [also equal to read_alleles_size()]
 //    // All of the reads confidently asserting reference.
 //    + ref_supporting_read_count
 //    // All of the reads supporting ref without a confident alignment.
@@ -193,7 +194,7 @@ message Allele {
 //
 message AlleleCount {
   // The position on the genome of this AlleleCount.
-  learning.genomics.v1.Position position = 1;
+  nucleus.genomics.v1.Position position = 1;
 
   // The reference bases of this AlleleCount. Since AlleleCount currently
   // only represents a single location, this field should always be a
@@ -240,7 +241,7 @@ message AlleleCountSummary {
 message DeepVariantCall {
   // A Variant call based on the information in allele_count. Will always be a
   // non-reference variant call (no gVCF or reference records).
-  learning.genomics.v1.Variant variant = 1;
+  nucleus.genomics.v1.Variant variant = 1;
 
   // A map from an alt allele in Variant to Read key that support that allele.
   // Every alt allele in the variant will have an entry. Reference supporting
@@ -267,7 +268,7 @@ message AlleleCounterOptions {
   int32 partition_size = 1;
 
   // The requirements for reads to be used when counting alleles.
-  learning.genomics.core.ReadRequirements read_requirements = 2;
+  nucleus.genomics.v1.ReadRequirements read_requirements = 2;
 }
 
 // Variant call for a single site, in a pseudo-biallelic manner. This is an
@@ -276,7 +277,7 @@ message AlleleCounterOptions {
 // The `variant` here likely doesn't have fully filled information for output to
 // a VCF file yet.
 message CallVariantsOutput {
-  learning.genomics.v1.Variant variant = 1;
+  nucleus.genomics.v1.Variant variant = 1;
 
   // The alt allele indices is represented as a sub-message so that it's easier
   // to re-use as a standalone proto for encoding+decoding.
@@ -292,6 +293,7 @@ message CallVariantsOutput {
     bool has_insertion = 2;
     bool has_deletion = 3;
     bool is_snp = 4;
+    int32 true_label = 5;
   }
   DebugInfo debug_info = 4;
 }
@@ -345,7 +347,7 @@ message VariantLabelerOptions {
 }
 
 // Options to control how our we construct pileup images.
-// Next ID: 22.
+// Next ID: 23.
 message PileupImageOptions {
   // The height, in pixels, of the pileup image we'll construct.
   int32 height = 1;
@@ -359,9 +361,9 @@ message PileupImageOptions {
   // Controls how bases are encoded as red pixel values.
   //
   // A is base_color_offset_a_and_g + base_color_stride * 3
-  // C is base_color_offset_a_and_g + base_color_stride * 2
-  // G is base_color_offset_t_and_c + base_color_stride * 1
-  // T is base_color_offset_t_and_c + base_color_stride * 0
+  // G is base_color_offset_a_and_g + base_color_stride * 2
+  // T is base_color_offset_t_and_c + base_color_stride * 1
+  // C is base_color_offset_t_and_c + base_color_stride * 0
   //
   // The offset in red color space for A and G bases.
   int32 base_color_offset_a_and_g = 4;
@@ -402,7 +404,7 @@ message PileupImageOptions {
   int32 read_overlap_buffer_bp = 17;
 
   // The requirements for reads to be used when creating pileup images.
-  learning.genomics.core.ReadRequirements read_requirements = 18;
+  nucleus.genomics.v1.ReadRequirements read_requirements = 18;
 
   enum MultiAllelicMode {
     UNSPECIFIED = 0;
@@ -417,12 +419,16 @@ message PileupImageOptions {
 
   // The random seed to use in our Pileup Image Creation.
   uint32 random_seed = 21;
+
+  // The number of data channels in our pileup images.
+  int32 num_channels = 22;
 }
 
 
-// High-level options that encapsolates all of the parameters needed to run
+// High-level options that encapsulates all of the parameters needed to run
 // DeepVariant end-to-end.
-// Next ID: 26.
+// Next ID: 29.
+// redacted
 message DeepVariantOptions {
   // A list of contig names we never want to call variants on. For example,
   // chrM in humans is the mitocondrial genome and the caller isn't trained to
@@ -430,7 +436,7 @@ message DeepVariantOptions {
   repeated string exclude_contigs = 1;
 
   // List of regions where we want to call variants. If missing, we will call
-  // variants throughout the entire genomie.
+  // variants throughout the entire genome.
   repeated string calling_regions = 2;
 
   // Fixed random seed to use for DeepVariant itself.
@@ -454,7 +460,7 @@ message DeepVariantOptions {
   // Only reads satisfying these requirements will be used in DeepVariant.
   // This parameters are propagated as appropriate to read_requirement fields
   // in our tool-specific options.
-  learning.genomics.core.ReadRequirements read_requirements = 9;
+  nucleus.genomics.v1.ReadRequirements read_requirements = 9;
 
   // Options to control out input data sources and output data sinks.
   // Path to our genome reference.
@@ -517,6 +523,30 @@ message DeepVariantOptions {
   // indicates the probability that a read will be kept (randomly) when read
   // from the input. This option makes it easy to simulate lower coverage data.
   float downsample_fraction = 25;
+
+  // List of regions where we DON'T want to call variants. If missing, no
+  // regions will be excluded from calling.
+  repeated string exclude_calling_regions = 26;
+
+  // An enumeration of all of the labeler algorithms we support in DeepVariant.
+  enum LabelerAlgorithm {
+    UNSPECIFIED_LABELER_ALGORITHM = 0;
+    // The labeling algorithm used with DeepVariant 0.4-0.5, which does position
+    // matching to find truth variant to label our candidates.
+    POSITIONAL_LABELER = 1;
+    // A haplotype-aware labeling algorithm, similar to hap.py xcmp, that looks
+    // for genotypes for candidate variants that produce haplotypes that match
+    // those implied by the genotypes of our truth variants. Produces more
+    // accurate labels than the POSITIONAL_LABELER labeling algorithm.
+    HAPLOTYPE_LABELER = 2;
+    // The labeling algorithm which labels the variants into customized classes
+    // specified in the specified INFO field in the VCF file.
+    CUSTOMIZED_CLASSES_LABELER = 3;
+  }
+  // The labeling algorithm we are using in this DeepVariant run. Only needed
+  // when in CALLING mode.
+  LabelerAlgorithm labeler_algorithm = 27;
+  string run_info_filename = 28;
 }
 
 // Config describe information needed for a dataset that can be used for
@@ -534,8 +564,10 @@ message DeepVariantDatasetConfig {
   int32 num_examples = 3;
 }
 
+// Next ID: 3.
 message DeepVariantInputDatasets {
   // Fields in Dataset are provided to make_examples.py as arguments.
+  // Next ID: 9.
   message Dataset {
     // Path to a BED file that contains the confident regions for creating TF
     // examples.
@@ -548,6 +580,197 @@ message DeepVariantInputDatasets {
     string truth_variants = 4;
     // Space-separated list of regions we want to process.
     string regions = 5;
+    // A float number (< 1.0) that allows make_examples to sample more HOMREF
+    // examples. The value can also be "null" which means using the default.
+    string training_random_emit_ref_sites = 6;
+    // List of downsample_fractions. Accepted values are strings that can be
+    // parsed into a value between (0, 1), or the string "null" which means
+    // no downsampling.
+    repeated string downsample_fractions = 7;
+
+    // Space-separated list of regions we want to exclude.
+    string exclude_regions = 8;
   }
   repeated Dataset datasets = 1;
+  string group_name = 2;
+}
+
+message DeepVariantInputDatasetsGroup {
+  repeated DeepVariantInputDatasets groups = 1;
+}
+
+// Metrics on the labeling of candidate / truth variants when running
+// DeepVariant's make_examples in training mode.
+// Next ID: 17.
+message LabelingMetrics {
+  // Notes on counting by site or by allele:
+  //
+  // Throughout this proto we often measure the same quantity (e.g., false
+  // positives) by site and by alleles. This reflects two different ways of
+  // counting errors in genomes where the number of chromosomes > 1. We can give
+  // a concrete example:
+  //
+  //  Candidate: chr20:10 with A/C
+  //  Truth: chr20:10 with A/C alleles and with genotype (0, 1)
+  //
+  // Since we have the same variant with the same alleles at the same position
+  // in both the candidates and the truth, the matching is trivial. For this
+  // variant, we'd update our counts as follows:
+  //
+  //   # We have only a single site, so we +1 to each truth and candidates.
+  //   n_truth_variant_sites += 1
+  //   n_candidate_variant_sites += 1
+  //
+  //   # Both the candidate and truth variants only have 1 alternative allele,
+  //   # so we increment the allele counts by 1 as well.
+  //   n_truth_variant_alleles += 1
+  //   n_candidate_variant_alleles += 1
+  //
+  // A similar logic would apply to counting true positives (+1), false
+  // negatives (+0), and false positives (+0) for both sites and alleles.
+  //
+  // Now let's take a more complex example where candidates and truth differ
+  // in their alleles:
+  //
+  //  Candidate: chr20:20 with A/C/T
+  //  Truth: chr20:20 with A/C/G alleles and with genotype (1, 2)
+  //
+  // Here we have a candidate and truth at the same position but they can only
+  // be partially matched, since the truth variant includes a G allele (e.g.,
+  // genotype == 2) that isn't even present in the candidate. And the candidate
+  // has an extra allele T that isn't real. Matching these variants produces a
+  // genotype of (0, 1) for the candidate, since we have one copy of the C
+  // allele (e.g., genotype == 1) but we cannot match the true G allele, so we
+  // are forced to say one allele is reference (e.g., genotype == 0).
+  //
+  // Now let's update our counts:
+  //
+  //   # We have only a single site, so we +1 to each truth and candidates, even
+  //   # though they both have multiple alt allele, as this is the sites-level
+  //   # metric.
+  //   n_truth_variant_sites += 1
+  //   n_candidate_variant_sites += 1
+  //
+  //   # Both variants have 2 alternative alleles, so we +2 each of the alleles
+  //   # counts.
+  //   n_truth_variant_alleles += 2
+  //   n_candidate_variant_alleles += 2
+  //
+  //   # Now for the complex TP/FN/FP counts.
+  //   # We found a candidate for this true site, even though we didn't get all
+  //   # of the alleles, so we increment the n_true_positive_sites by 1 and get
+  //   # +0 for each of the FN and FP sites metrics:
+  //   n_true_positive_sites  += 1
+  //   n_false_negative_sites += 0
+  //   n_false_positive_sites += 0
+  //
+  //   # However, we only got one of the two true positive alleles, so we get
+  //   # one TP allele (the C), one FN allele (the missed G), and one FP allele
+  //   # (the bad T allele in the candidate).
+  //   n_true_positive_alleles  += 1
+  //   n_false_negative_alleles += 1
+  //   n_false_positive_alleles += 1
+
+  // Notes on deriving higher-level metrics from the counts here:
+  //
+  // This proto only contains counts, not ratios like PPV, since we want to make
+  // it easy to sum up the metrics in this protos across shared make_example
+  // runs. That said, it's valuable to note here how to compute common
+  // ratiometric statistics from the counts in this proto since there are many
+  // fields to choose from. I give the sites-level metrics here, but the
+  // allele-level values can be computed similarily.
+  //
+  // See https://en.wikipedia.org/wiki/Positive_and_negative_predictive_values
+  // for a general description of these metrics.
+  //
+  // PPV is TP / (TP + FP):
+  // n_true_positive_sites / (n_true_positive_sites + n_false_positive_sites)
+  //
+  // Sensitivity: TP / (TP + FN)
+  // n_true_positive_sites / (n_true_positive_sites + n_false_negative_sites)
+
+  // Counts of candidate and truth variants by site and by allele.
+  //
+  // The sites metrics are essentially the number of records seen of each type,
+  // after removing non-PASS truth variants, regardless of the number of alleles
+  // in the records. The allele metrics are like the sites metrics, but instead
+  // of getting a +1 for each record we get +N for each site where N is the
+  // number of alternative alleles.
+  //
+  // See above for more information on the difference between sites and alleles
+  // counting.
+  int32 n_truth_variant_sites = 1;
+  int32 n_truth_variant_alleles = 2;
+  int32 n_candidate_variant_sites = 3;
+  int32 n_candidate_variant_alleles = 4;
+  int32 n_non_confident_candidate_variant_sites = 5;
+
+  // Counts of TP, FN, and FP implied by the labeling of candidates against
+  // truth.
+  //
+  // See above for more information on the difference between sites and alleles
+  // counting.
+  //
+  // Note that we don't track true negatives since true negatives are poorly
+  // defined in the variant calling problem.
+
+  // TPs:
+  //
+  // The number of true variants assigned a non-ref genotype in the match for
+  // the sites calculation. For the allele calculation, the number of true
+  // variant alleles with a gt > 0 in the assignment.
+  int32 n_true_positive_sites = 6;
+  int32 n_true_positive_alleles = 7;
+
+  // FNs:
+  //
+  // The number of true variants assigned 0/0 genotypes for the sites
+  // calculation. For the allele calculation, the number of true variant alleles
+  // without a gt > 0 in the assignment.
+  int32 n_false_negative_sites = 8;
+  int32 n_false_negative_alleles = 9;
+
+  // FPs:
+  //
+  // The number of candidate variants assigned a 0/0 genotype for the sites
+  // calculation. For the allele calculation, the number of candidate variant
+  // alternative alleles without a genotype > 0 in the assignment.
+  int32 n_false_positive_sites = 10;
+  int32 n_false_positive_alleles = 11;
+
+  // A few more complex metrics that aren't derivable from the above metrics as
+  // their calculation requires access to the underlying matched variants
+  // themselves.
+
+  // The number of candidate variants (counted by site) that are assigned a
+  // non-reference genotype (e.g., != 0/0) but that don't have an exact
+  // position match in truth.
+  int32 n_inexact_position_matches = 12;
+
+  // A count of the number of sites where the candidate and truth variants occur
+  // at the same position, with increasingly strict additional matching
+  // criteria. These metrics are all computed over sites, not alleles.
+  //
+  // The number of sites where candidate and truth have the same start position.
+  int32 n_exact_position_matches = 13;
+  // Same criteria as above but with the additional requirement that all of the
+  // alleles be exactly the same between candidate and truth.
+  int32 n_exact_position_and_allele_matches = 14;
+  // Same criteria as above but with the additional requirement that the matched
+  // genotypes to be identical as well.
+  int32 n_exact_position_and_allele_and_genotype_matches = 15;
+
+  // Number of truth variants (counted by site) with more than one alternative
+  // allele where at least one alternative allele was missed (i.e., was assigned
+  // a genotype of 0 in the match).
+  int32 n_truth_multiallelics_sites_with_missed_alleles = 16;
+}
+
+// Configuration and runtime information about a MakeExamples run in
+// DeepVariant.
+// Next ID: 4.
+message MakeExamplesRunInfo {
+  DeepVariantOptions options = 1;
+  LabelingMetrics labeling_metrics = 2;
+  ResourceMetrics resource_metrics = 3;
 }

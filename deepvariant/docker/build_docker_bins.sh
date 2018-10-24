@@ -34,15 +34,22 @@ set -x
 # A helper script for building python binaries required for the deepvariant
 # docker image.
 
-./build-prereq.sh  # implies run-prereq.sh
+source settings.sh  # Make sure we define DV_COPT_FLAGS used below.
+./build-prereq.sh   # implies run-prereq.sh
+
+# For bazel.
+PATH="$HOME/bin:$PATH"
 
 # Build all required binaries as python zip files. Note that par executables
 # that are using subpar library does not yet work due to c-extensions not being
 # supported. Also symlinks do not work in Dockerfile, so copy them explicitly
 # to //deepvariant/docker directory.
-# Note: this is missing --copt=-mavx2 and --copt=-mfma. See b/67778043.
-bazel build --build_python_zip -c opt --copt=-msse4.1 --copt=-msse4.2 \
-    --copt=-mavx --copt=-O3 \
+# shellcheck disable=SC2086
+# because DV_COPT_FLAGS contains (potentially) multiple optimization flags but
+# is set as an environment variable in setting.sh via build-prereq.sh and
+# therefore cannot be an array. So in order to expand correctly we do not
+# surround the variable with quotes.
+bazel build --build_python_zip -c opt ${DV_COPT_FLAGS} \
     //deepvariant:make_examples \
     //deepvariant:call_variants \
     //deepvariant:postprocess_variants \
@@ -50,5 +57,4 @@ bazel build --build_python_zip -c opt --copt=-msse4.1 --copt=-msse4.2 \
     //deepvariant:model_eval
 cp bazel-bin/deepvariant/*.zip deepvariant/docker/
 cp run-prereq.sh settings.sh deepvariant/docker/
-cp *.whl deepvariant/docker/
 cp LICENSE AUTHORS deepvariant/docker/

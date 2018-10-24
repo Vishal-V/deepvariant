@@ -1,45 +1,23 @@
 # Testing utilities that are temporarily located here until they can
 # be separately open source.
+load("//:tools/nucleus.bzl", "nucleus_py_library", "nucleus_py_extension", "nucleus_py_binary")
 
 package(default_visibility = ["//:__subpackages__"])
 
-test_suite(
-    name = "smoke_tests",
-    tests = [
-        "gunit_extras_test",
-    ],
-)
-
-py_library(
+nucleus_py_library(
     name = "flagsaver",
     srcs = ["flagsaver.py"],
     srcs_version = "PY2AND3",
+    deps = ["@io_abseil_py//absl/flags"],
 )
 
-cc_library(
-    name = "gunit_extras",
-    testonly = True,
-    srcs = [
-        "protocol-buffer-matchers.cc",
-    ],
-    hdrs = [
-        "protocol-buffer-matchers.h",
-    ],
+nucleus_py_library(
+    name = "tf_test_utils",
+    srcs = ["tf_test_utils.py"],
+    srcs_version = "PY2AND3",
     deps = [
-        "@com_googlesource_code_re2//:re2",
-        "@org_tensorflow//tensorflow/core:lib",
-        "@org_tensorflow//tensorflow/core:test",
-        "@protobuf_archive//:protobuf",
-    ],
-)
-
-cc_test(
-    name = "gunit_extras_test",
-    size = "small",
-    srcs = ["gunit_extras_test.cc"],
-    deps = [
-        ":gunit_extras",
-        "@com_google_googletest//:gtest_main",
-        "@protobuf_archive//:protobuf",
+        "//deepvariant:dv_constants",
+        "//deepvariant:modeling",
+        "@io_abseil_py//absl/flags",
     ],
 )

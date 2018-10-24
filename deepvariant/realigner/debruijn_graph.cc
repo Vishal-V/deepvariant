@@ -38,17 +38,16 @@
 #include <tuple>
 #include <vector>
 
-#include "deepvariant/core/genomics/reads.pb.h"
-#include "deepvariant/core/utils.h"
 #include "deepvariant/protos/realigner.pb.h"
+#include "absl/strings/ascii.h"
 #include "boost/graph/adjacency_list.hpp"
 #include "boost/graph/depth_first_search.hpp"
 #include "boost/graph/graph_traits.hpp"
 #include "boost/graph/graphviz.hpp"
 #include "boost/graph/reverse_graph.hpp"
+#include "third_party/nucleus/protos/reads.pb.h"
+#include "third_party/nucleus/util/utils.h"
 #include "tensorflow/core/platform/logging.h"
-#include "tensorflow/core/lib/strings/str_util.h"
-#include "tensorflow/core/lib/core/stringpiece.h"
 
 namespace learning {
 namespace genomics {
@@ -59,10 +58,10 @@ using VertexIndexMap = DeBruijnGraph::VertexIndexMap;
 using Edge = DeBruijnGraph::Edge;
 using Path = DeBruijnGraph::Path;
 
-using Read = learning::genomics::v1::Read;
+using Read = nucleus::genomics::v1::Read;
 
 using tensorflow::string;
-using tensorflow::StringPiece;
+using absl::string_view;
 
 namespace {
 
@@ -129,23 +128,23 @@ std::set<Vertex> VerticesReachableFrom(
 
 }  // namespace
 
-Vertex DeBruijnGraph::EnsureVertex(StringPiece kmer) {
+Vertex DeBruijnGraph::EnsureVertex(string_view kmer) {
   Vertex v;
   auto vertex_find = kmer_to_vertex_.find(kmer);
   if (vertex_find != kmer_to_vertex_.end()) {
     v = (*vertex_find).second;
   } else {
-    // N.B. TensorFlow StringPiece lacks explicit string conversion func.
-    string kmer_copy = string(kmer.data(), kmer.size());
+    string kmer_copy(kmer);
     v = boost::add_vertex(VertexInfo{kmer_copy}, g_);
     // N.B.: must use the long-lived string in the map key as the referent of
-    // the StringPiece key.
-    kmer_to_vertex_[StringPiece(g_[v].kmer)] = v;
+    // the string_view key.
+    kmer_to_vertex_[string_view(g_[v].kmer)] = v;
   }
+
   return v;
 }
 
-Vertex DeBruijnGraph::VertexForKmer(StringPiece kmer) const {
+Vertex DeBruijnGraph::VertexForKmer(string_view kmer) const {
   return kmer_to_vertex_.at(kmer);
 }
 
@@ -194,23 +193,53 @@ DeBruijnGraph::DeBruijnGraph(const string& ref,
   RebuildIndexMap();
 }
 
+
+// Indicates that we couldn't find a minimum k that can be used.
+constexpr int kBoundsNoWorkingK = -1;
+struct KBounds {
+  int min_k;  // Mininum k to consider (inclusive).
+  int max_k;  // Maximum k to consider (inclusive).
+};
+
+
+KBounds KMinMaxFromReference(const string_view ref,
+                             const DeBruijnGraph::Options& options) {
+  KBounds bounds;
+  bounds.min_k = kBoundsNoWorkingK;
+  bounds.max_k  = std::min(options.max_k(), static_cast<int>(ref.size()) - 1);
+
+  for (int k = options.min_k(); k <= bounds.max_k; k += options.step_k()) {
+    bool has_cycle = false;
+    std::set<string_view> kmers;
+
+    for (int i = 0; i < ref.size() - k + 1; i++) {
+      string_view kmer = ref.substr(i, k);
+      if (kmers.insert(kmer).second == false) {
+        // No insertion took place because the kmer already exists. This implies
+        // that there's a cycle in the graph.
+        has_cycle = true;
+        break;
+      }
+    }
+
+    if (!has_cycle) {
+      bounds.min_k = k;
+      break;
+    }
+  }
+
+  return bounds;
+}
+
 std::unique_ptr<DeBruijnGraph> DeBruijnGraph::Build(
     const string& ref, const std::vector<Read>& reads,
     const DeBruijnGraph::Options& options) {
 
-  std::unique_ptr<DeBruijnGraph> graph, trial_graph;
-  int max_k  = std::min(options.max_k(), static_cast<int>(ref.size()) - 1);
+  KBounds bounds = KMinMaxFromReference(ref, options);
+  if (bounds.min_k == kBoundsNoWorkingK) return nullptr;
 
-  for (int k = options.min_k(); k <= max_k; k += options.step_k()) {
-    // If we can't get an acyclic graph from just the reference, we should go on
-    // to the next k -- an optimization.
-    // N.B.: MakeUnique doesn't work with private constructors.
-    trial_graph = std::unique_ptr<DeBruijnGraph>(
-        new DeBruijnGraph(ref, {}, options, k));
-    if (trial_graph->HasCycle()) {
-      continue;
-    }
-    graph = std::unique_ptr<DeBruijnGraph>(
+  for (int k = bounds.min_k; k <= bounds.max_k; k += options.step_k()) {
+    std::unique_ptr<DeBruijnGraph> graph = std::unique_ptr<DeBruijnGraph>(
         new DeBruijnGraph(ref, reads, options, k));
     if (graph->HasCycle()) {
       continue;
@@ -222,9 +251,7 @@ std::unique_ptr<DeBruijnGraph> DeBruijnGraph::Build(
   return nullptr;
 }
 
-Edge DeBruijnGraph::AddEdge(StringPiece from, StringPiece to, bool is_ref) {
-  Vertex from_vertex = EnsureVertex(from);
-  Vertex to_vertex = EnsureVertex(to);
+Edge DeBruijnGraph::AddEdge(Vertex from_vertex, Vertex to_vertex, bool is_ref) {
   bool was_present;
   Edge edge;
   std::tie(edge, was_present) = boost::edge(from_vertex, to_vertex, g_);
@@ -238,40 +265,80 @@ Edge DeBruijnGraph::AddEdge(StringPiece from, StringPiece to, bool is_ref) {
   return edge;
 }
 
-void DeBruijnGraph::AddEdgesForReference(StringPiece ref) {
-  StringPiece kmer_prev, kmer_cur;
-  const signed int ref_length = ref.size();
-  for (int i = 0; i < ref_length - k_ + 1; i++) {
-    kmer_prev = kmer_cur;
-    kmer_cur = ref.substr(i, k_);
-    if (i > 0) {
-      AddEdge(kmer_prev, kmer_cur, true);
+void DeBruijnGraph::AddKmersAndEdges(string_view bases, int start, int end,
+                                     bool is_ref) {
+  CHECK_GE(start, 0);
+  CHECK_LE(start + k_, bases.size());
+  CHECK_LE(end + k_, bases.size());
+
+  // End can be less than 0, in which case we return without doing any work.
+  if (end > 0) {
+    Vertex vertex_prev = EnsureVertex(bases.substr(start, k_));
+    for (int i = start + 1; i <= end; ++i) {
+      Vertex vertex_cur = EnsureVertex(bases.substr(i, k_));
+      AddEdge(vertex_prev, vertex_cur, is_ref);
+      vertex_prev = vertex_cur;
     }
   }
 }
 
-void DeBruijnGraph::AddEdgesForRead(const learning::genomics::v1::Read& read) {
-  string bases = tensorflow::str_util::Uppercase(read.aligned_sequence());
-  StringPiece bases_view(bases);
-  std::vector<int> qual(read.aligned_quality().begin(),
-                        read.aligned_quality().end());
-  CHECK(qual.size() == bases.size());
+void DeBruijnGraph::AddEdgesForReference(string_view ref) {
+  AddKmersAndEdges(ref, 0, ref.size() - k_, true /* is_ref */);
+}
 
-  const signed int read_length = bases.size();
 
-  // This set maintains the QC-failing positions among [i..i+k].
-  std::set<int> recent_qc_fail_positions;
+void DeBruijnGraph::AddEdgesForRead(const nucleus::genomics::v1::Read& read) {
+  const string bases = absl::AsciiStrToUpper(read.aligned_sequence());
 
-  for (int i = 0; i < read_length - k_; ++i) {
-    // Update QC fail set: remove (i-1), add (i+k) if it fails QC.
-    recent_qc_fail_positions.erase(i - 1);
-    if (!IsCanonicalBase(bases[i + k_], core::CanonicalBases::ACGT)
-        || qual[i + k_] < options_.min_base_quality()) {
-      recent_qc_fail_positions.insert(i + k_);
+  // Lambda function to find the next bad position in the read, if one exists,
+  // starting from offset `start` in the read. If all remains bases/quals are
+  // good, returns bases.size().
+  auto NextBadPosition = [&read, &bases, this](int start) -> int {
+    for (int i = start; i < bases.size(); ++i) {
+      if (!IsCanonicalBase(bases[i], nucleus::CanonicalBases::ACGT) ||
+          read.aligned_quality()[i] < options_.min_base_quality()) {
+        return i;
+      }
     }
-    if (recent_qc_fail_positions.empty()) {
-      AddEdge(bases_view.substr(i, k_), bases_view.substr(i + 1, k_), false);
-    }
+    return bases.size();
+  };
+
+  // This algorithm is simple and fast, but it isn't the most straightforward
+  // implementation so it merits a few comments.
+  //
+  // Suppose I have the following data:
+  //
+  // offset: 01234567
+  // bases:  ACGTAACC
+  // bad? :  00010000
+  // k_   :  2 <= using a kmer size of 2
+  //
+  // The algorithm below loops over positions (variable `i`), pulling kmers of
+  // length k from positions `i` and `i + 1` to add as edges. The key
+  // calculation is NextBadPosition that searches from the current `i` position
+  // for the next position that is bad. In the above example, this would be the
+  // 3 position. We then loop from i until `next_bad_position - k`, to create
+  // our edges, since we know that everything from i to next_bad_position is
+  // good but we cannot construct a valid kmer that overlaps next_bad_position
+  // so it invalidates all kmer starts from `next_bad_position - k`. Finally, we
+  // set i to `next_bad_position + 1`, which is the very next starting position
+  // after the last bad position, and the algorithm repeats.
+  //
+  // This algorithm has many important properties for performance:
+  //
+  //   * It doesn't allocate any data structures to support the calculation.
+  //   * It only examines whether a given position is good/bad once.
+  //   * The loop to add edges is streamlined, without any unnecessary checks.
+  //
+  const string_view bases_view(bases);
+  // Note that this SIGNED int type declaration is key to avoid
+  // bases.size() - k_ underflowing.
+  const int stop = bases.size() - k_;
+  int i = 0;
+  while (i < stop) {
+    int next_bad_position = NextBadPosition(i);
+    AddKmersAndEdges(bases_view, i, next_bad_position - k_, false /* is_ref */);
+    i = next_bad_position + 1;
   }
 }
 

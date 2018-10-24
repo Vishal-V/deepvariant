@@ -41,99 +41,207 @@ import csv
 import os
 import os.path
 
-
+from absl import flags
 import tensorflow as tf
 
-from deepvariant.core import genomics_io
-from deepvariant.core import ranges
-from deepvariant.core import utils
+from third_party.nucleus.io import sam
+from third_party.nucleus.util import ranges
+from third_party.nucleus.util import utils
 from deepvariant.protos import realigner_pb2
 from deepvariant.realigner import aligner
 from deepvariant.realigner import window_selector
 from deepvariant.realigner.python import debruijn_graph
+from deepvariant.realigner.python import fast_pass_aligner
 from deepvariant.vendor import timer
+from google.protobuf import text_format
 
-tf.flags.DEFINE_integer(
-    'ws_min_num_supporting_reads', 3,
+_UNSET_WS_INT_FLAG = -1
+
+flags.DEFINE_bool('ws_use_window_selector_model', True,
+                  'Activate the use of window selector models.')
+flags.DEFINE_string(
+    'ws_window_selector_model', None,
+    'Path to a text format proto of the window selector model to use.')
+flags.DEFINE_integer(
+    'ws_min_num_supporting_reads', _UNSET_WS_INT_FLAG,
     'Minimum number of supporting reads to call a reference position for local '
     'assembly.')
-tf.flags.DEFINE_integer(
-    'ws_max_num_supporting_reads', 300,
+flags.DEFINE_integer(
+    'ws_max_num_supporting_reads', _UNSET_WS_INT_FLAG,
     'Maximum number of supporting reads to call a reference position for local '
     'assembly.')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer(
     'ws_min_mapq', 20,
     'Minimum read alignment quality to consider in calling a reference '
     'position for local assembly.')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer(
     'ws_min_base_quality', 20,
     'Minimum base quality to consider in calling a reference position for '
     'local assembly.')
-tf.flags.DEFINE_integer(
-    'ws_min_windows_distance', 70,
+flags.DEFINE_integer(
+    'ws_min_windows_distance', 80,
     'Minimum distance between candidate windows for local assembly.')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer(
     'ws_max_window_size', 1000,
     'Maximum window size to consider for local assembly. Large noisy regions '
     'are skipped for realignment.')
-tf.flags.DEFINE_integer('dbg_min_k', 10,
-                        'Initial k-mer size to build the graph.')
-tf.flags.DEFINE_integer(
-    'dbg_max_k', 100,
+flags.DEFINE_integer(
+    'ws_region_expansion_in_bp', 20,
+    'Number of bases to expand the region when calculating windows; larger '
+    'values add overhead but allow larger nearby events to contribute evidence '
+    'for assembling an region even if they are not contained by the region.')
+flags.DEFINE_integer('dbg_min_k', 10, 'Initial k-mer size to build the graph.')
+flags.DEFINE_integer(
+    'dbg_max_k', 101,
     'Maximum k-mer size. Larger k-mer size is used to resolve graph cycles.')
-tf.flags.DEFINE_integer(
-    'dbg_step_k', 1, 'Increment size for k to try in resolving graph cycles.')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer('dbg_step_k', 1,
+                     'Increment size for k to try in resolving graph cycles.')
+flags.DEFINE_integer(
     'dbg_min_mapq', 14,
     'Minimum read alignment quality to consider in building the graph.')
-tf.flags.DEFINE_integer(
-    'dbg_min_base_quality', 17,
+flags.DEFINE_integer(
+    'dbg_min_base_quality', 15,
     'Minimum base quality in a k-mer sequence to consider in building the '
     'graph.')
-tf.flags.DEFINE_integer('dbg_min_edge_weight', 2,
-                        'Minimum number of supporting reads to keep an edge.')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer('dbg_min_edge_weight', 2,
+                     'Minimum number of supporting reads to keep an edge.')
+flags.DEFINE_integer(
     'dbg_max_num_paths', 256,
     'Maximum number of paths within a graph to consider for realignment. '
     'Set max_num_paths to 0 to have unlimited number of paths.')
-tf.flags.DEFINE_integer('aln_match', 4,
-                        'Match score (expected to be a non-negative score).')
-tf.flags.DEFINE_integer('aln_mismatch', 6,
-                        'Mismatch score (expected to be a non-negative score).')
-tf.flags.DEFINE_integer(
+flags.DEFINE_integer('aln_match', 4,
+                     'Match score (expected to be a non-negative score).')
+flags.DEFINE_integer('aln_mismatch', 6,
+                     'Mismatch score (expected to be a non-negative score).')
+flags.DEFINE_integer(
     'aln_gap_open', 8, 'Gap open score (expected to be a non-negative score). '
     'Score for a gap of length g is -(gap_open + (g - 1) * gap_extend).')
-tf.flags.DEFINE_integer(
-    'aln_gap_extend', 1,
+flags.DEFINE_integer(
+    'aln_gap_extend', 2,
     'Gap extend score (expected to be a non-negative score). '
     'Score for a gap of length g is -(gap_open + (g - 1) * gap_extend).')
-tf.flags.DEFINE_integer('aln_k', 23,
-                        'k-mer size used to index target sequence.')
-tf.flags.DEFINE_float('aln_error_rate', .01, 'Estimated sequencing error rate.')
-tf.flags.DEFINE_string(
+flags.DEFINE_integer('aln_k', 23, 'k-mer size used to index target sequence.')
+flags.DEFINE_float('aln_error_rate', .01, 'Estimated sequencing error rate.')
+flags.DEFINE_string(
     'realigner_diagnostics', '',
     'Root directory where the realigner should place diagnostic output (such as'
     ' a dump of the DeBruijn graph, and a log of metrics reflecting the graph '
     'and  realignment to the haplotypes).  If empty, no diagnostics are output.'
 )
-tf.flags.DEFINE_bool(
+flags.DEFINE_bool(
     'emit_realigned_reads', False,
     'If True, we will emit realigned reads if our realigner_diagnostics are '
     'also enabled.')
+flags.DEFINE_bool(
+    'use_fast_pass_aligner', True,
+    'If True, fast_pass_aligner (improved performance) implementation is used ')
+flags.DEFINE_integer(
+    'max_num_mismatches', 2,
+    'Num of maximum allowed mismatches for quick read to '
+    'haplotype alignment.')
+flags.DEFINE_float(
+    'realignment_similarity_threshold', 0.16934,
+    'Similarity threshold used in realigner in Smith-Waterman'
+    'alignment.')
+flags.DEFINE_integer('kmer_size', 32,
+                     'K-mer size for fast pass alinger reads index.')
+
 
 # Margin added to the reference sequence for the aligner module.
 _REF_ALIGN_MARGIN = 20
+
+_DEFAULT_MIN_SUPPORTING_READS = 2
+_DEFAULT_MAX_SUPPORTING_READS = 300
+_ALLELE_COUNT_LINEAR_MODEL_DEFAULT = realigner_pb2.WindowSelectorModel(
+    model_type=realigner_pb2.WindowSelectorModel.ALLELE_COUNT_LINEAR,
+    allele_count_linear_model=realigner_pb2.WindowSelectorModel.
+    AlleleCountLinearModel(
+        bias=-0.683379,
+        coeff_soft_clip=2.997000,
+        coeff_substitution=-0.086644,
+        coeff_insertion=2.493585,
+        coeff_deletion=1.795914,
+        coeff_reference=-0.059787,
+        decision_boundary=3))
 
 # ---------------------------------------------------------------------------
 # Set configuration settings.
 # ---------------------------------------------------------------------------
 
 
-def realigner_config(flags):
+def window_selector_config(flags_obj):
+  """Creates a WindowSelectorOptions proto based on input and default settings.
+
+  Args:
+    flags_obj: configuration FLAGS.
+
+  Returns:
+    realigner_pb2.WindowSelector protobuf.
+
+  Raises:
+    ValueError: If either ws_{min,max}_supporting_reads are set and
+      ws_use_window_selector_model is True.
+      Or if ws_window_selector_model > ws_max_num_supporting_reads.
+      Or if ws_use_window_selector_model is False and
+      ws_window_selector_model is not None.
+  """
+  if not flags_obj.ws_use_window_selector_model:
+    if flags_obj.ws_window_selector_model is not None:
+      raise ValueError('Cannot specify a ws_window_selector_model '
+                       'if ws_use_window_selector_model is False.')
+
+    min_num_supporting_reads = (
+        _DEFAULT_MIN_SUPPORTING_READS
+        if flags_obj.ws_min_num_supporting_reads == _UNSET_WS_INT_FLAG else
+        flags_obj.ws_min_num_supporting_reads)
+    max_num_supporting_reads = (
+        _DEFAULT_MAX_SUPPORTING_READS
+        if flags_obj.ws_max_num_supporting_reads == _UNSET_WS_INT_FLAG else
+        flags_obj.ws_max_num_supporting_reads)
+    window_selector_model = realigner_pb2.WindowSelectorModel(
+        model_type=realigner_pb2.WindowSelectorModel.VARIANT_READS,
+        variant_reads_model=realigner_pb2.WindowSelectorModel.
+        VariantReadsThresholdModel(
+            min_num_supporting_reads=min_num_supporting_reads,
+            max_num_supporting_reads=max_num_supporting_reads))
+  else:
+    if flags_obj.ws_min_num_supporting_reads != _UNSET_WS_INT_FLAG:
+      raise ValueError('Cannot use both ws_min_num_supporting_reads and '
+                       'ws_use_window_selector_model flags.')
+    if flags_obj.ws_max_num_supporting_reads != _UNSET_WS_INT_FLAG:
+      raise ValueError('Cannot use both ws_max_num_supporting_reads and '
+                       'ws_use_window_selector_model flags.')
+
+    if flags_obj.ws_window_selector_model is None:
+      window_selector_model = _ALLELE_COUNT_LINEAR_MODEL_DEFAULT
+    else:
+      with tf.gfile.GFile(flags_obj.ws_window_selector_model) as f:
+        window_selector_model = text_format.Parse(
+            f.read(), realigner_pb2.WindowSelectorModel())
+
+  if (window_selector_model.model_type ==
+      realigner_pb2.WindowSelectorModel.VARIANT_READS):
+    model = window_selector_model.variant_reads_model
+    if model.max_num_supporting_reads < model.min_num_supporting_reads:
+      raise ValueError('ws_min_supporting_reads should be smaller than '
+                       'ws_max_supporting_reads.')
+
+  ws_config = realigner_pb2.WindowSelectorOptions(
+      min_mapq=flags_obj.ws_min_mapq,
+      min_base_quality=flags_obj.ws_min_base_quality,
+      min_windows_distance=flags_obj.ws_min_windows_distance,
+      max_window_size=flags_obj.ws_max_window_size,
+      region_expansion_in_bp=flags_obj.ws_region_expansion_in_bp,
+      window_selector_model=window_selector_model)
+
+  return ws_config
+
+
+def realigner_config(flags_obj):
   """Creates a RealignerOptions proto based on input and default settings.
 
   Args:
-    flags: configuration FLAGS.
+    flags_obj: configuration FLAGS.
 
   Returns:
     realigner_pb2.RealignerOptions protobuf.
@@ -141,35 +249,33 @@ def realigner_config(flags):
   Raises:
     ValueError: If we observe invalid flag values.
   """
-  ws_config = realigner_pb2.RealignerOptions.WindowSelectorOptions(
-      min_num_supporting_reads=flags.ws_min_num_supporting_reads,
-      max_num_supporting_reads=flags.ws_max_num_supporting_reads,
-      min_mapq=flags.ws_min_mapq,
-      min_base_quality=flags.ws_min_base_quality,
-      min_windows_distance=flags.ws_min_windows_distance,
-      max_window_size=flags.ws_max_window_size)
+  ws_config = window_selector_config(flags_obj)
 
-  dbg_config = realigner_pb2.RealignerOptions.DeBruijnGraphOptions(
-      min_k=flags.dbg_min_k,
-      max_k=flags.dbg_max_k,
-      step_k=flags.dbg_step_k,
-      min_mapq=flags.dbg_min_mapq,
-      min_base_quality=flags.dbg_min_base_quality,
-      min_edge_weight=flags.dbg_min_edge_weight,
-      max_num_paths=flags.dbg_max_num_paths)
+  dbg_config = realigner_pb2.DeBruijnGraphOptions(
+      min_k=flags_obj.dbg_min_k,
+      max_k=flags_obj.dbg_max_k,
+      step_k=flags_obj.dbg_step_k,
+      min_mapq=flags_obj.dbg_min_mapq,
+      min_base_quality=flags_obj.dbg_min_base_quality,
+      min_edge_weight=flags_obj.dbg_min_edge_weight,
+      max_num_paths=flags_obj.dbg_max_num_paths)
 
-  aln_config = realigner_pb2.RealignerOptions.AlignerOptions(
-      match=flags.aln_match,
-      mismatch=flags.aln_mismatch,
-      gap_open=flags.aln_gap_open,
-      gap_extend=flags.aln_gap_extend,
-      k=flags.aln_k,
-      error_rate=flags.aln_error_rate)
+  aln_config = realigner_pb2.AlignerOptions(
+      match=flags_obj.aln_match,
+      mismatch=flags_obj.aln_mismatch,
+      gap_open=flags_obj.aln_gap_open,
+      gap_extend=flags_obj.aln_gap_extend,
+      k=flags_obj.aln_k,
+      error_rate=flags_obj.aln_error_rate,
+      max_num_of_mismatches=flags_obj.max_num_mismatches,
+      realignment_similarity_threshold=flags_obj.
+      realignment_similarity_threshold,
+      kmer_size=flags_obj.kmer_size)
 
-  diagnostics = realigner_pb2.RealignerOptions.Diagnostics(
-      enabled=bool(flags.realigner_diagnostics),
-      output_root=flags.realigner_diagnostics,
-      emit_realigned_reads=flags.emit_realigned_reads)
+  diagnostics = realigner_pb2.Diagnostics(
+      enabled=bool(flags_obj.realigner_diagnostics),
+      output_root=flags_obj.realigner_diagnostics,
+      emit_realigned_reads=flags_obj.emit_realigned_reads)
 
   return realigner_pb2.RealignerOptions(
       ws_config=ws_config,
@@ -228,7 +334,7 @@ class DiagnosticLogger(object):
     """Logs, if enabled, the realigned reads for region."""
     if self.enabled and self.config.emit_realigned_reads:
       path = self._file_for_region(region, self.realigned_reads_filename)
-      with genomics_io.make_read_writer(path) as writer:
+      with sam.SamWriter(path) as writer:
         for read in reads:
           writer.write(read)
 
@@ -274,6 +380,13 @@ class AssemblyRegion(object):
     self.candidate_haplotypes = candidate_haplotypes
     self.reads = []
     self._read_span = None
+
+  def __str__(self):
+    return ('AssemblyRegion(region={}, span={}) with {} haplotypes and {} '
+            'reads').format(
+                ranges.to_literal(self.region),
+                ranges.to_literal(self.read_span), len(self.haplotypes),
+                len(self.reads))
 
   @property
   def haplotypes(self):
@@ -350,35 +463,24 @@ class Realigner(object):
     """
     self.config = config
     self.ref_reader = ref_reader
-    self.window_sel = window_selector.WindowSelector(self.config.ws_config)
     self.diagnostic_logger = DiagnosticLogger(self.config.diagnostics)
-
-  def call_window_selector(self, region, reads):
-    """Helper function to call window_selector module."""
-    return sorted(
-        self.window_sel.process_reads(
-            self.ref_reader.bases(region), reads, region.reference_name,
-            region.start),
-        key=ranges.as_tuple)
 
   def call_debruijn_graph(self, windows, reads):
     """Helper function to call debruijn_graph module."""
     windows_haplotypes = []
     # Build and process de-Bruijn graph for each window.
+    sam_reader = sam.InMemorySamReader(reads)
+
     for window in windows:
       if window.end - window.start > self.config.ws_config.max_window_size:
         continue
-      if not self.ref_reader.is_valid_interval(window):
+      if not self.ref_reader.is_valid(window):
         continue
-      ref = self.ref_reader.bases(window)
-      # redacted
-      dbg_reads = [
-          read for read in reads
-          if ranges.ranges_overlap(window, utils.read_range(read))
-      ]
+      ref = self.ref_reader.query(window)
+      window_reads = list(sam_reader.query(window))
 
       with timer.Timer() as t:
-        graph = debruijn_graph.build(ref, dbg_reads, self.config.dbg_config)
+        graph = debruijn_graph.build(ref, window_reads, self.config.dbg_config)
       graph_building_time = t.GetDuration()
 
       if not graph:
@@ -410,15 +512,15 @@ class Realigner(object):
         max(assembled_region.read_span.end, assembled_region.region.end) +
         _REF_ALIGN_MARGIN)
 
-    ref_prefix = self.ref_reader.bases(
+    ref_prefix = self.ref_reader.query(
         ranges.make_range(contig, ref_start, assembled_region.region.start))
-    ref = self.ref_reader.bases(assembled_region.region)
+    ref = self.ref_reader.query(assembled_region.region)
 
     # If we can't create the ref suffix then return the original alignments.
     if ref_end <= assembled_region.region.end:
       return assembled_region.reads
     else:
-      ref_suffix = self.ref_reader.bases(
+      ref_suffix = self.ref_reader.query(
           ranges.make_range(contig, assembled_region.region.end, ref_end))
 
     ref_region = ranges.make_range(contig, ref_start, ref_end)
@@ -428,6 +530,48 @@ class Realigner(object):
         ref_prefix + target + ref_suffix
         for target in assembled_region.haplotypes
     ], assembled_region.reads)
+
+  def call_fast_pass_aligner(self, assembled_region):
+    """Helper function to call fast pass aligner module."""
+    if not assembled_region.reads:
+      return []
+
+    contig = assembled_region.region.reference_name
+    ref_start = max(
+        0,
+        min(assembled_region.read_span.start, assembled_region.region.start) -
+        _REF_ALIGN_MARGIN)
+    ref_end = min(
+        self.ref_reader.contig(contig).n_bases,
+        max(assembled_region.read_span.end, assembled_region.region.end) +
+        _REF_ALIGN_MARGIN)
+
+    ref_prefix = self.ref_reader.query(
+        ranges.make_range(contig, ref_start, assembled_region.region.start))
+    ref = self.ref_reader.query(assembled_region.region)
+
+    # If we can't create the ref suffix then return the original alignments.
+    if ref_end <= assembled_region.region.end:
+      return assembled_region.reads
+    else:
+      ref_suffix = self.ref_reader.query(
+          ranges.make_range(contig, assembled_region.region.end, ref_end))
+
+    ref_seq = ref_prefix + ref + ref_suffix
+
+    fast_pass_realigner = fast_pass_aligner.FastPassAligner()
+    # Read sizes may vary. We need this for realigner initialization and sanity
+    # checks.
+    self.config.aln_config.read_size = len(
+        assembled_region.reads[0].aligned_sequence)
+    fast_pass_realigner.set_options(self.config.aln_config)
+    fast_pass_realigner.set_reference(ref_seq)
+    fast_pass_realigner.set_ref_start(contig, ref_start)
+    fast_pass_realigner.set_haplotypes([
+        ref_prefix + target + ref_suffix
+        for target in assembled_region.haplotypes
+    ])
+    return fast_pass_realigner.realign_reads(assembled_region.reads)
 
   def realign_reads(self, reads, region):
     """Run realigner.
@@ -445,20 +589,22 @@ class Realigner(object):
       - Output all input reads (whether they required realignment or not).
 
     Args:
-      reads: [`learning.genomics.deepvariant.core.genomics.Read` protos]. The
+      reads: [`third_party.nucleus.protos.Read` protos]. The
         list of input reads to realign.
-      region: A `learning.genomics.deepvariant.core.genomics.Range` proto.
+      region: A `third_party.nucleus.protos.Range` proto.
         Specifies the region on the genome we should process.
 
     Returns:
       [realigner_pb2.CandidateHaplotypes]. Information on the list of candidate
         haplotypes.
-      [`learning.genomics.deepvariant.core.genomics.Read` protos]. The realigned
+      [`third_party.nucleus.protos.Read` protos]. The realigned
         reads for the region. NOTE THESE READS MAY NO LONGER BE IN THE SAME
         ORDER AS BEFORE.
     """
     # Compute the windows where we need to assemble in the region.
-    candidate_windows = self.call_window_selector(region, reads)
+    candidate_windows = window_selector.select_windows(
+        self.config.ws_config, self.ref_reader, reads, region)
+
     # Assemble each of those regions.
     candidate_haplotypes = self.call_debruijn_graph(candidate_windows, reads)
     # Create our simple container to store candidate / read mappings.
@@ -471,7 +617,12 @@ class Realigner(object):
     # Walk over each region and align the reads in that region, adding them to
     # our realigned_reads.
     for assembled_region in assembled_regions:
-      realigned_reads.extend(self.call_aligner(assembled_region))
+      if flags.FLAGS.use_fast_pass_aligner:
+        realigned_reads_copy = self.call_fast_pass_aligner(assembled_region)
+      else:
+        realigned_reads_copy = self.call_aligner(assembled_region)
+
+      realigned_reads.extend(realigned_reads_copy)
 
     self.diagnostic_logger.log_realigned_reads(region, realigned_reads)
 

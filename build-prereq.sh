@@ -60,10 +60,21 @@ note_build_stage "Install Java and friends"
 if ! java -version 2>&1 | fgrep "1.8"; then
   echo "No Java 8, will install."
   sudo -H apt-get install -y software-properties-common debconf-utils
-  sudo add-apt-repository -y ppa:webupd8team/java
+  # Debian needs authentication.
+  # (http://www.webupd8.org/2014/03/how-to-install-oracle-java-8-in-debian.html)
+  [[ $(lsb_release -d | grep 'Debian') ]] && \
+    sudo -H apt-get install -y gnupg dirmngr && \
+    sudo -H apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys EEA14886
+  echo "deb http://ppa.launchpad.net/webupd8team/java/ubuntu xenial main" | sudo -H tee /etc/apt/sources.list.d/webupd8team-java.list
+  echo "deb-src http://ppa.launchpad.net/webupd8team/java/ubuntu xenial main" | sudo -H tee -a /etc/apt/sources.list.d/webupd8team-java.list
   sudo -H apt-get -qq -y update
   echo "oracle-java8-installer shared/accepted-oracle-license-v1-1 select true" | sudo debconf-set-selections
-  sudo -H apt-get install -y oracle-java8-installer
+  # Installing with "--allow-unauthenticated" because otherwise we get:
+  #  WARNING: The following packages cannot be authenticated!
+  #  oracle-java8-installer oracle-java8-set-default
+  #  E: There were unauthenticated packages and -y was used without --allow-unauthenticated
+  # This is not ideal. Should fix later.
+  sudo -H apt-get install -y oracle-java8-installer --allow-unauthenticated
   sudo -H apt-get -y install ca-certificates-java
   sudo update-ca-certificates -f
 else
@@ -76,18 +87,29 @@ fi
 
 note_build_stage "Install bazel"
 
-if bazel --bazelrc=/dev/null --nomaster_bazelrc version
-then
-  echo "Bazel already installed on the machine, not reinstalling"
-else
-  # https://bazel.build/versions/master/docs/install-ubuntu.html
-  echo "deb [arch=amd64] http://storage.googleapis.com/bazel-apt stable jdk1.8" |
-    sudo tee /etc/apt/sources.list.d/bazel.list
-  curl https://bazel.build/bazel-release.pub.gpg | sudo apt-key add -
-  sudo -H apt-get -qq -y update
-  sudo -H apt-get -y install bazel
-  sudo -H apt-get -y upgrade bazel
-fi
+function ensure_wanted_bazel_version {
+  local wanted_bazel_version=$1
+  rm -rf ~/bazel
+  mkdir ~/bazel
+
+  if
+    v=$(bazel --bazelrc=/dev/null --nomaster_bazelrc version) &&
+    echo "$v" | awk -v b="$wanted_bazel_version" '/Build label/ { exit ($3 != b)}'
+  then
+    echo "Bazel ${wanted_bazel_version} already installed on the machine, not reinstalling"
+  else
+    pushd ~/bazel
+    curl -L -O https://github.com/bazelbuild/bazel/releases/download/"${wanted_bazel_version}"/bazel-"${wanted_bazel_version}"-installer-linux-x86_64.sh
+    chmod +x bazel-*.sh
+    ./bazel-"${wanted_bazel_version}"-installer-linux-x86_64.sh --user
+    rm bazel-"${wanted_bazel_version}"-installer-linux-x86_64.sh
+    popd
+
+    PATH="$HOME/bin:$PATH"
+  fi
+}
+
+ensure_wanted_bazel_version "${DV_BAZEL_VERSION}"
 
 ################################################################################
 # CLIF
@@ -105,17 +127,19 @@ else
   case "$(lsb_release -d)" in
     *Ubuntu*16.*.*) export DV_PLATFORM="ubuntu-16" ;;
     *Ubuntu*14.*.*) export DV_PLATFORM="ubuntu-14" ;;
-    *) echo "CLIF is not installed on this machine and a prebuilt binary is not 
+    *Debian*9.*)    export DV_PLATFORM="debian" ;;
+    *Debian*rodete) export DV_PLATFORM="debian" ;;
+    *) echo "CLIF is not installed on this machine and a prebuilt binary is not
 unavailable for this platform. Please install CLIF at
 https://github.com/google/clif before continuing."
     exit 1
   esac
 
-  OSS_CLIF_ROOT="${DV_PACKAGE_BUCKET_PATH}/oss_clif"
+  OSS_CLIF_CURL_ROOT="${DV_PACKAGE_CURL_PATH}/oss_clif"
   OSS_CLIF_PKG="oss_clif.${DV_PLATFORM}.latest.tgz"
 
   if [[ ! -f "/tmp/${OSS_CLIF_PKG}" ]]; then
-      gsutil cp "${OSS_CLIF_ROOT}/${OSS_CLIF_PKG}" /tmp/
+    curl "${OSS_CLIF_CURL_ROOT}/${OSS_CLIF_PKG}" > /tmp/${OSS_CLIF_PKG}
   fi
 
   (cd / && sudo tar xzf "/tmp/${OSS_CLIF_PKG}")
@@ -128,10 +152,13 @@ fi
 
 note_build_stage "Download and configure TensorFlow sources"
 
-(cd .. &&
- git clone https://github.com/tensorflow/tensorflow &&
- cd tensorflow &&
- git checkout "${DV_TENSORFLOW_GIT_SHA}" &&
+if [[ ! -d ../tensorflow ]]; then
+  note_build_stage "Cloning TensorFlow from github as ../tensorflow doesn't exist"
+  (cd .. && git clone https://github.com/tensorflow/tensorflow)
+fi
+
+(cd ../tensorflow &&
+ git checkout "${DV_CPP_TENSORFLOW_TAG}" &&
  echo | ./configure)
 
 note_build_stage "build-prereq.sh complete"
